@@ -29,7 +29,11 @@ PORT = int(os.getenv("PORT", "8080"))
 
 # 超级维护员（可跨群授权管理员），逗号分隔
 # 例如：ROOT_ADMIN_IDS=123456,987654
-ROOT_ADMIN_IDS = {int(x.strip()) for x in os.getenv("ROOT_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+ROOT_ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ROOT_ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
 # 默认风控
 MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "3"))
@@ -518,15 +522,14 @@ def fmt_rule_row(r):
     rid, name, p, mn, mx, en, pr = r
     return f"{'✅' if en else '❌'} {name}｜{p*100:.3f}%｜{milli_to_coin(mn)}~{milli_to_coin(mx)}"
 
-def kb_home(is_admin_any: bool):
+def kb_home():
     rows = [
         [InlineKeyboardButton("💰 我的金币", callback_data="v3:me"),
          InlineKeyboardButton("🛒 商店", callback_data="v3:shop:0")],
-        [InlineKeyboardButton("🎯 掉落规则", callback_data="v3:rules_read:0")]
+        [InlineKeyboardButton("🎯 掉落规则", callback_data="v3:rules_read:0")],
+        [InlineKeyboardButton("🗂️ 选择管理群组", callback_data="v3:groups:0")],
+        [InlineKeyboardButton("⚙️ 当前群管理面板", callback_data="v3:admin_home")]
     ]
-    if is_admin_any:
-        rows.append([InlineKeyboardButton("🗂️ 选择管理群组", callback_data="v3:groups:0")])
-        rows.append([InlineKeyboardButton("⚙️ 当前群管理面板", callback_data="v3:admin_home")])
     return InlineKeyboardMarkup(rows)
 
 def kb_groups(user_id: int, page: int):
@@ -675,24 +678,16 @@ def ensure_admin_selected_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE)
 # Commands
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text("已启动。输入 /panel 打开面板。")
-
-async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
     uid = update.effective_user.id
     chats = list_user_admin_chats(uid)
-    is_admin_any = len(chats) > 0
-
-    if is_admin_any and selected_chat_id(context) <= 0:
-        # 默认选第一个群
+    if chats and selected_chat_id(context) <= 0:
         context.user_data["sel_chat_id"] = chats[0][0]
         context.user_data["sel_chat_title"] = chats[0][1]
-
     await update.message.reply_text(
-        "📋 控制面板\n说明：管理员请先点击“选择管理群组”，后续管理数据将仅限该群。",
-        reply_markup=kb_home(is_admin_any)
+        "📋 控制面板\n说明：请先点击“选择管理群组”，后续管理数据仅限该群。",
+        reply_markup=kb_home()
     )
 
 async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -808,14 +803,12 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     uid = update.effective_user.id
 
-    is_admin_any = len(list_user_admin_chats(uid)) > 0
-
     if data == "v3:noop":
         return
     if data == "v3:home":
         await q.edit_message_text(
-            "📋 控制面板\n说明：管理员请先选择管理群组。",
-            reply_markup=kb_home(is_admin_any)
+            "📋 控制面板\n说明：请先点击“选择管理群组”，后续管理数据仅限该群。",
+            reply_markup=kb_home()
         )
         return
 
@@ -824,13 +817,13 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 优先当前聊天群（若是群），否则用已选群
         chat_id = q.message.chat_id if q.message.chat.type in ("group", "supergroup") else selected_chat_id(context)
         if chat_id <= 0:
-            await q.edit_message_text("请先选择管理群组后再查看（或在群里打开）", reply_markup=kb_home(is_admin_any))
+            await q.edit_message_text("请先选择管理群组后再查看（或在群里打开）", reply_markup=kb_home())
             return
         bal = wallet_get(chat_id, uid)
         got = int(rds.get(f"daily:{chat_id}:{uid}") or 0)
         await q.edit_message_text(
             f"💰 你的余额：{milli_to_coin(bal)}\n今日已获得：{milli_to_coin(got)} / {milli_to_coin(DAILY_MAX_MILLI)}",
-            reply_markup=kb_home(is_admin_any)
+            reply_markup=kb_home()
         )
         return
 
@@ -838,7 +831,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = max(0, safe_int(data.split(":")[2], 0))
         chat_id = q.message.chat_id if q.message.chat.type in ("group", "supergroup") else selected_chat_id(context)
         if chat_id <= 0:
-            await q.edit_message_text("请先选择管理群组（或在群里打开）", reply_markup=kb_home(is_admin_any))
+            await q.edit_message_text("请先选择管理群组（或在群里打开）", reply_markup=kb_home())
             return
         await q.edit_message_text("🛒 商店（点击购买）", reply_markup=kb_shop(chat_id, page))
         return
@@ -857,7 +850,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = max(0, safe_int(data.split(":")[2], 0))
         chat_id = q.message.chat_id if q.message.chat.type in ("group", "supergroup") else selected_chat_id(context)
         if chat_id <= 0:
-            await q.edit_message_text("请先选择管理群组（或在群里打开）", reply_markup=kb_home(is_admin_any))
+            await q.edit_message_text("请先选择管理群组（或在群里打开）", reply_markup=kb_home())
             return
         await q.edit_message_text("🎯 掉落规则（中文说明）", reply_markup=kb_rules_read(chat_id, page))
         return
@@ -885,12 +878,10 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 管理员一级：群组选择
     if data.startswith("v3:groups:"):
-        if not is_admin_any:
-            await q.answer("你没有任何群管理员权限", show_alert=True)
-            return
         page = max(0, safe_int(data.split(":")[2], 0))
         await q.edit_message_text(
-            "🗂️ 请选择管理群组（仅显示你有权限的群）",
+            "🗂️ 请选择管理群组（仅显示你有权限的群）\n"
+            "如果列表为空，请先在目标群执行 /bind_admin 你的ID",
             reply_markup=kb_groups(uid, page)
         )
         return
@@ -916,7 +907,10 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "v3:admin_home":
         ok, v = ensure_admin_selected_chat(uid, context)
         if not ok:
-            await q.edit_message_text(v, reply_markup=kb_home(is_admin_any))
+            await q.edit_message_text(
+                f"⚠️ {v}\n请先点击“选择管理群组”。",
+                reply_markup=kb_home()
+            )
             return
         cid = v
         title = context.user_data.get("sel_chat_title", str(cid))
@@ -1284,8 +1278,8 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # /start 直接进面板；移除 /panel
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("additem", additem_cmd))
     app.add_handler(CommandHandler("bind_admin", bind_admin_cmd))
