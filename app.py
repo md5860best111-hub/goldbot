@@ -528,7 +528,7 @@ def kb_home():
          InlineKeyboardButton("🛒 商店", callback_data="v3:shop:0")],
         [InlineKeyboardButton("🎯 掉落规则", callback_data="v3:rules_read:0")],
         [InlineKeyboardButton("🗂️ 选择管理群组", callback_data="v3:groups:0")],
-        [InlineKeyboardButton("⚙️ 当前群管理面板", callback_data="v3:admin_home")]
+        [InlineKeyboardButton("⚙️ 管理中心", callback_data="v3:admin_home")]
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -544,6 +544,10 @@ def kb_groups(user_id: int, page: int):
         InlineKeyboardButton(f"第{page+1}页", callback_data="v3:noop"),
         InlineKeyboardButton("➡️", callback_data=f"v3:groups:{page+1}")
     ])
+    rows.append([
+        InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid"),
+        InlineKeyboardButton("🔄 刷新", callback_data="v3:groups:0")
+    ])
     rows.append([InlineKeyboardButton("🔙 返回", callback_data="v3:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -553,7 +557,8 @@ def kb_admin_home():
          InlineKeyboardButton("🧾 操作日志", callback_data="v3:logs:0")],
         [InlineKeyboardButton("⚙️ 规则管理", callback_data="v3:adm_rules:0"),
          InlineKeyboardButton("🎁 商品管理", callback_data="v3:adm_shop:0")],
-        [InlineKeyboardButton("🛡️ 群管理员", callback_data="v3:adm_list")],
+        [InlineKeyboardButton("🛡️ 群管理员", callback_data="v3:adm_list"),
+         InlineKeyboardButton("🔁 切换群组", callback_data="v3:groups:0")],
         [InlineKeyboardButton("🔙 返回", callback_data="v3:home")]
     ])
 
@@ -666,6 +671,9 @@ def kb_item_edit(item_id: int):
 def selected_chat_id(context: ContextTypes.DEFAULT_TYPE):
     return safe_int(context.user_data.get("sel_chat_id"), 0)
 
+def selected_chat_title(context: ContextTypes.DEFAULT_TYPE):
+    return context.user_data.get("sel_chat_title", "")
+
 def ensure_admin_selected_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     cid = selected_chat_id(context)
     if cid <= 0:
@@ -686,8 +694,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["sel_chat_id"] = chats[0][0]
         context.user_data["sel_chat_title"] = chats[0][1]
     await update.message.reply_text(
-        "📋 控制面板\n说明：请先点击“选择管理群组”，后续管理数据仅限该群。",
+        "📋 控制面板\n"
+        "说明：先“选择管理群组”，管理数据按群隔离。",
         reply_markup=kb_home()
+    )
+
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    await update.message.reply_text(f"你的用户ID：{update.effective_user.id}")
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    uid = update.effective_user.id
+    chat = update.effective_chat
+    cid = chat.id
+    root = is_root_admin(uid)
+    cadm = is_chat_admin(cid, uid) if chat.type in ("group", "supergroup") else False
+    sel = selected_chat_id(context)
+    await update.message.reply_text(
+        f"user_id={uid}\nchat_id={cid}\nchat_type={chat.type}\n"
+        f"is_root={root}\nis_chat_admin_here={cadm}\nselected_chat_id={sel}"
     )
 
 async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -757,7 +785,10 @@ async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     operator = update.effective_user.id
     allowed = is_root_admin(operator) or is_chat_admin(chat_id, operator)
     if not allowed:
-        await update.message.reply_text("无权限：仅根管理员或本群管理员可授权")
+        await update.message.reply_text(
+            "无权限：仅根管理员或本群管理员可授权\n"
+            "可先发送 /whoami 检查身份，或让 root 先授权你。"
+        )
         return
 
     if not context.args:
@@ -805,9 +836,14 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "v3:noop":
         return
+
+    if data == "v3:show_myid":
+        await q.answer(f"你的ID: {uid}", show_alert=True)
+        return
+
     if data == "v3:home":
         await q.edit_message_text(
-            "📋 控制面板\n说明：请先点击“选择管理群组”，后续管理数据仅限该群。",
+            "📋 控制面板\n说明：先“选择管理群组”，管理数据按群隔离。",
             reply_markup=kb_home()
         )
         return
@@ -879,9 +915,23 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 管理员一级：群组选择
     if data.startswith("v3:groups:"):
         page = max(0, safe_int(data.split(":")[2], 0))
+        chats = list_user_admin_chats(uid)
+        if not chats:
+            await q.edit_message_text(
+                "🗂️ 你还没有可管理的群\n\n"
+                "请在目标群由 root 或现管理员执行：\n"
+                "/bind_admin 你的用户ID\n\n"
+                "先发 /myid 获取你的ID",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid")],
+                    [InlineKeyboardButton("🔄 刷新", callback_data="v3:groups:0")],
+                    [InlineKeyboardButton("🔙 返回", callback_data="v3:home")]
+                ])
+            )
+            return
+
         await q.edit_message_text(
-            "🗂️ 请选择管理群组（仅显示你有权限的群）\n"
-            "如果列表为空，请先在目标群执行 /bind_admin 你的ID",
+            "🗂️ 请选择管理群组（仅显示你有权限的群）",
             reply_markup=kb_groups(uid, page)
         )
         return
@@ -891,15 +941,12 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cid <= 0 or not is_chat_admin(cid, uid):
             await q.answer("无权限选择该群", show_alert=True)
             return
-        # 保存会话中的当前群
         context.user_data["sel_chat_id"] = cid
-        # 取标题
         chats = {c[0]: c[1] for c in list_user_admin_chats(uid)}
         context.user_data["sel_chat_title"] = chats.get(cid, str(cid))
         ensure_default_rules(cid)
         await q.edit_message_text(
-            f"✅ 已切换管理群：{context.user_data['sel_chat_title']}\n"
-            f"后续管理数据均为该群，互不相通。",
+            f"✅ 已切换管理群：{context.user_data['sel_chat_title']}\n后续管理数据均为该群，互不相通。",
             reply_markup=kb_admin_home()
         )
         return
@@ -913,9 +960,11 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         cid = v
-        title = context.user_data.get("sel_chat_title", str(cid))
+        title = selected_chat_title(context) or str(cid)
+        role = "root+群管理员" if is_root_admin(uid) else "群管理员"
         await q.edit_message_text(
-            f"⚙️ 当前管理群：{title}\n请选择管理功能：",
+            f"⚙️ 管理中心\n当前群：{title}\n你的身份：{role}\n"
+            f"快捷命令：/bind_admin 用户ID ｜ /unbind_admin 用户ID",
             reply_markup=kb_admin_home()
         )
         return
@@ -1275,11 +1324,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def main():
     init_db()
+    logger.info("ROOT_ADMIN_IDS loaded: %s", sorted(list(ROOT_ADMIN_IDS)))
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # /start 直接进面板；移除 /panel
+    # /start 直接进面板；无 /panel
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("additem", additem_cmd))
     app.add_handler(CommandHandler("bind_admin", bind_admin_cmd))
