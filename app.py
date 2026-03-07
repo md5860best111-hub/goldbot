@@ -16,24 +16,23 @@ from telegram.ext import (
 )
 
 # -----------------------
-# 基础配置
+# 环境变量
 # -----------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # 例如 https://xxx.zeabur.app
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # 例如 https://xxx.zeabur.app
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
-ADMIN_IDS = set(
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
-)
+# 默认超级管理员（首次初始化用）
+DEFAULT_OWNER_IDS = "631234269,6376186830"
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-REDIS_URL = os.getenv("REDIS_URL", "")
-
-# 风控参数（可调）
+# 风控
 MIN_TEXT_LEN = int(os.getenv("MIN_TEXT_LEN", "5"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "20"))
-DAILY_MAX_MILLI = int(os.getenv("DAILY_MAX_MILLI", "50000"))  # 每日最多 50 金币
+DAILY_MAX_MILLI = int(os.getenv("DAILY_MAX_MILLI", "50000"))  # 50金币/天
 ENABLE_SAME_TEXT_BLOCK = os.getenv("ENABLE_SAME_TEXT_BLOCK", "1") == "1"
 
 logging.basicConfig(level=logging.INFO)
@@ -58,26 +57,20 @@ def milli_to_coin(m: int) -> str:
     return f"{m / 1000:.3f}".rstrip("0").rstrip(".")
 
 def parse_redis_url(url: str):
-    # 兼容 redis://[:password]@host:port/db
     u = urlparse(url)
     return {
         "host": u.hostname,
         "port": u.port or 6379,
         "db": int((u.path or "/0").replace("/", "") or 0),
         "password": u.password,
-        "decode_responses": True
+        "decode_responses": True,
     }
 
 
 # -----------------------
-# 全局连接池
+# 连接池
 # -----------------------
-pg_pool = SimpleConnectionPool(
-    minconn=1,
-    maxconn=20,  # 你的量级够用
-    dsn=DATABASE_URL
-)
-
+pg_pool = SimpleConnectionPool(minconn=1, maxconn=20, dsn=DATABASE_URL)
 rds = redis.Redis(**parse_redis_url(REDIS_URL))
 rds.ping()
 
@@ -113,6 +106,7 @@ def init_db(conn):
       PRIMARY KEY (chat_id, user_id)
     );
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS drop_rules (
       id BIGSERIAL PRIMARY KEY,
@@ -125,6 +119,7 @@ def init_db(conn):
       priority INT NOT NULL DEFAULT 100
     );
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS shop_items (
       id BIGSERIAL PRIMARY KEY,
@@ -136,6 +131,7 @@ def init_db(conn):
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS redeem_orders (
       id BIGSERIAL PRIMARY KEY,
@@ -147,8 +143,82 @@ def init_db(conn):
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
     """)
+
+    # 管理员表（支持手动增删）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bot_admins (
+      user_id BIGINT PRIMARY KEY,
+      is_owner BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+    """)
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_rules_chat ON drop_rules(chat_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_shop_chat ON shop_items(chat_id);")
+
+    # 初始化默认 owner
+    owner_ids = [x.strip() for x in os.getenv("OWNER_IDS", DEFAULT_OWNER_IDS).split(",") if x.strip()]
+    for oid in owner_ids:
+        cur.execute("""
+        INSERT INTO bot_admins(user_id, is_owner)
+        VALUES(%s, TRUE)
+        ON CONFLICT(user_id) DO NOTHING
+        """, (int(oid),))
+
+
+@with_conn
+def is_admin(conn, user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM bot_admins WHERE user_id=%s", (user_id,))
+    return cur.fetchone() is not None
+
+@with_conn
+def is_owner(conn, user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT is_owner FROM bot_admins WHERE user_id=%s", (user_id,))
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+@with_conn
+def list_admins(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, is_owner, created_at FROM bot_admins ORDER BY is_owner DESC, created_at ASC")
+    return cur.fetchall()
+
+@with_conn
+def add_admin(conn, operator_id: int, new_admin_id: int):
+    # 仅 owner 可以加管理员
+    cur = conn.cursor()
+    cur.execute("SELECT is_owner FROM bot_admins WHERE user_id=%s", (operator_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return False, "只有 owner 可以添加管理员"
+
+    cur.execute("""
+    INSERT INTO bot_admins(user_id, is_owner)
+    VALUES(%s, FALSE)
+    ON CONFLICT(user_id) DO NOTHING
+    """, (new_admin_id,))
+    return True, "已添加管理员"
+
+@with_conn
+def del_admin(conn, operator_id: int, target_id: int):
+    # 仅 owner 可以删管理员；owner 不能互删
+    cur = conn.cursor()
+    cur.execute("SELECT is_owner FROM bot_admins WHERE user_id=%s", (operator_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return False, "只有 owner 可以删除管理员"
+
+    cur.execute("SELECT is_owner FROM bot_admins WHERE user_id=%s", (target_id,))
+    t = cur.fetchone()
+    if not t:
+        return False, "目标不在管理员列表"
+    if t[0]:
+        return False, "不能删除 owner"
+
+    cur.execute("DELETE FROM bot_admins WHERE user_id=%s", (target_id,))
+    return True, "已删除管理员"
 
 
 @with_conn
@@ -165,7 +235,6 @@ def ensure_default_rules(conn, chat_id: int):
         (%s,'epic',0.0001,2000,10000,TRUE,80)
         """, (chat_id, chat_id, chat_id))
 
-
 @with_conn
 def get_rules(conn, chat_id: int):
     cur = conn.cursor()
@@ -175,9 +244,14 @@ def get_rules(conn, chat_id: int):
       WHERE chat_id=%s AND enabled=TRUE
       ORDER BY priority ASC, id ASC
     """, (chat_id,))
-    rows = cur.fetchall()
-    return rows
+    return cur.fetchall()
 
+@with_conn
+def wallet_get(conn, chat_id: int, user_id: int) -> int:
+    cur = conn.cursor()
+    cur.execute("SELECT balance_milli FROM wallets WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
 
 @with_conn
 def wallet_add(conn, chat_id: int, user_id: int, delta: int):
@@ -191,67 +265,6 @@ def wallet_add(conn, chat_id: int, user_id: int, delta: int):
       updated_at = NOW()
     """, (chat_id, user_id, delta))
 
-
-@with_conn
-def wallet_get(conn, chat_id: int, user_id: int) -> int:
-    cur = conn.cursor()
-    cur.execute("SELECT balance_milli FROM wallets WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
-    row = cur.fetchone()
-    return int(row[0]) if row else 0
-
-
-@with_conn
-def buy_item_atomic(conn, chat_id: int, user_id: int, item_id: int):
-    cur = conn.cursor()
-
-    cur.execute("""
-    SELECT id, title, price_milli, enabled, stock
-    FROM shop_items
-    WHERE id=%s AND chat_id=%s
-    FOR UPDATE
-    """, (item_id, chat_id))
-    item = cur.fetchone()
-    if not item:
-        return (False, "商品不存在")
-    _id, title, price, enabled, stock = item
-    if not enabled:
-        return (False, "商品已下架")
-    if stock is not None and stock <= 0:
-        return (False, "商品已售罄")
-
-    # 锁钱包并判断余额
-    cur.execute("""
-    SELECT balance_milli FROM wallets
-    WHERE chat_id=%s AND user_id=%s
-    FOR UPDATE
-    """, (chat_id, user_id))
-    row = cur.fetchone()
-    bal = int(row[0]) if row else 0
-    if bal < price:
-        return (False, "金币不足")
-
-    # 扣款
-    if row:
-        cur.execute("""
-        UPDATE wallets SET balance_milli=balance_milli-%s, updated_at=NOW()
-        WHERE chat_id=%s AND user_id=%s
-        """, (price, chat_id, user_id))
-    else:
-        return (False, "金币不足")
-
-    # 扣库存
-    if stock is not None:
-        cur.execute("UPDATE shop_items SET stock=stock-1 WHERE id=%s", (item_id,))
-
-    # 记录订单
-    cur.execute("""
-    INSERT INTO redeem_orders(chat_id, user_id, item_id, price_milli, status)
-    VALUES(%s,%s,%s,%s,'approved')
-    """, (chat_id, user_id, item_id, price))
-
-    return (True, f"购买成功：{title}，扣除 {milli_to_coin(price)} 金币")
-
-
 @with_conn
 def shop_list(conn, chat_id: int):
     cur = conn.cursor()
@@ -264,7 +277,6 @@ def shop_list(conn, chat_id: int):
     """, (chat_id,))
     return cur.fetchall()
 
-
 @with_conn
 def add_item(conn, chat_id: int, title: str, price_milli: int, stock):
     cur = conn.cursor()
@@ -273,6 +285,48 @@ def add_item(conn, chat_id: int, title: str, price_milli: int, stock):
     VALUES(%s,%s,%s,TRUE,%s)
     """, (chat_id, title, price_milli, stock))
 
+@with_conn
+def buy_item_atomic(conn, chat_id: int, user_id: int, item_id: int):
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id, title, price_milli, enabled, stock
+    FROM shop_items
+    WHERE id=%s AND chat_id=%s
+    FOR UPDATE
+    """, (item_id, chat_id))
+    item = cur.fetchone()
+    if not item:
+        return False, "商品不存在"
+    _id, title, price, enabled, stock = item
+    if not enabled:
+        return False, "商品已下架"
+    if stock is not None and stock <= 0:
+        return False, "商品已售罄"
+
+    cur.execute("""
+    SELECT balance_milli FROM wallets
+    WHERE chat_id=%s AND user_id=%s
+    FOR UPDATE
+    """, (chat_id, user_id))
+    row = cur.fetchone()
+    bal = int(row[0]) if row else 0
+    if bal < price:
+        return False, "金币不足"
+
+    cur.execute("""
+    UPDATE wallets SET balance_milli=balance_milli-%s, updated_at=NOW()
+    WHERE chat_id=%s AND user_id=%s
+    """, (price, chat_id, user_id))
+
+    if stock is not None:
+        cur.execute("UPDATE shop_items SET stock=stock-1 WHERE id=%s", (item_id,))
+
+    cur.execute("""
+    INSERT INTO redeem_orders(chat_id, user_id, item_id, price_milli, status)
+    VALUES(%s,%s,%s,%s,'approved')
+    """, (chat_id, user_id, item_id, price))
+
+    return True, f"购买成功：{title}，扣除 {milli_to_coin(price)} 金币"
 
 @with_conn
 def list_rules(conn, chat_id: int):
@@ -284,7 +338,6 @@ def list_rules(conn, chat_id: int):
     ORDER BY priority ASC, id ASC
     """, (chat_id,))
     return cur.fetchall()
-
 
 @with_conn
 def set_rule(conn, chat_id: int, rule_id: int, probability: float, min_milli: int, max_milli: int, enabled: bool):
@@ -301,27 +354,23 @@ def set_rule(conn, chat_id: int, rule_id: int, probability: float, min_milli: in
 # Redis 风控
 # -----------------------
 def can_reward(chat_id: int, user_id: int, text: str) -> bool:
-    # 1) 冷却
     cooldown_key = f"cd:{chat_id}:{user_id}"
     if rds.exists(cooldown_key):
         return False
     rds.setex(cooldown_key, COOLDOWN_SECONDS, "1")
 
-    # 2) 同文案拦截（可选）
     if ENABLE_SAME_TEXT_BLOCK:
         t = (text or "").strip().lower()
         if t:
-            last_text_key = f"lt:{chat_id}:{user_id}"
-            old = rds.get(last_text_key)
+            k = f"lt:{chat_id}:{user_id}"
+            old = rds.get(k)
             if old == t:
                 return False
-            rds.setex(last_text_key, 120, t)
+            rds.setex(k, 120, t)
 
-    # 3) 每日上限
     daily_key = f"daily:{chat_id}:{user_id}"
-    # 这里只检查，不在此处加值；加值在真的发奖后进行
-    got = rds.get(daily_key)
-    if got and int(got) >= DAILY_MAX_MILLI:
+    got = int(rds.get(daily_key) or 0)
+    if got >= DAILY_MAX_MILLI:
         return False
 
     return True
@@ -330,16 +379,20 @@ def add_daily_reward(chat_id: int, user_id: int, amount: int):
     daily_key = f"daily:{chat_id}:{user_id}"
     p = rds.pipeline()
     p.incrby(daily_key, amount)
-    # 让 key 在次日自然过期（简单做24h滚动窗口）
     p.expire(daily_key, 86400)
     p.execute()
 
 
 # -----------------------
-# 命令处理
+# 命令
 # -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("金币机器人已启动。\n命令：/coins /shop /buy\n管理员：/additem /listrules /setrule")
+    await update.message.reply_text(
+        "金币机器人已启动。\n"
+        "用户命令：/coins /shop /buy\n"
+        "管理员：/additem /listrules /setrule\n"
+        "Owner：/addadmin /deladmin /listadmins"
+    )
 
 async def coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -354,10 +407,9 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("商店暂无商品")
         return
     lines = ["🛒 商店："]
-    for r in rows:
-        _id, title, price, stock = r
-        stock_text = "∞" if stock is None else str(stock)
-        lines.append(f"ID {_id} | {title} | {milli_to_coin(price)} 金币 | 库存:{stock_text}")
+    for _id, title, price, stock in rows:
+        stock_txt = "∞" if stock is None else str(stock)
+        lines.append(f"ID {_id} | {title} | {milli_to_coin(price)} 金币 | 库存:{stock_txt}")
     lines.append("\n购买：/buy 商品ID")
     await update.message.reply_text("\n".join(lines))
 
@@ -372,18 +424,17 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("商品ID必须是数字")
         return
-
     ok, msg = buy_item_atomic(chat_id, user_id, item_id)
     await update.message.reply_text(msg)
 
 async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         await update.message.reply_text("你不是管理员")
         return
 
-    # /additem 名称 | 价格 | 库存(可选, 留空表示无限)
+    # /additem 名称 | 价格 | 库存(可选)
     raw = update.message.text.replace("/additem", "", 1).strip()
     parts = [x.strip() for x in raw.split("|")]
     if len(parts) < 2:
@@ -398,7 +449,7 @@ async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stock = None
-    if len(parts) >= 3 and parts[2] != "":
+    if len(parts) >= 3 and parts[2]:
         try:
             stock = int(parts[2])
         except:
@@ -415,22 +466,18 @@ async def listrules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前无规则")
         return
     lines = ["🎯 掉落规则："]
-    for r in rows:
-        rid, name, p, mn, mx, en, pr = r
-        lines.append(
-            f"ID {rid} | {name} | p={p} | {milli_to_coin(mn)}~{milli_to_coin(mx)} | {'开' if en else '关'} | priority={pr}"
-        )
+    for rid, name, p, mn, mx, en, pr in rows:
+        lines.append(f"ID {rid} | {name} | p={p} | {milli_to_coin(mn)}~{milli_to_coin(mx)} | {'开' if en else '关'} | priority={pr}")
     await update.message.reply_text("\n".join(lines))
 
 async def setrule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /setrule 规则ID 概率 最小金币 最大金币 开关(1/0)
-    # 例：/setrule 3 0.001 1 2 1
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         await update.message.reply_text("你不是管理员")
         return
 
+    # /setrule 规则ID 概率 最小金币 最大金币 开关(1/0)
     if len(context.args) < 5:
         await update.message.reply_text("用法：/setrule 规则ID 概率 最小金币 最大金币 开关(1/0)")
         return
@@ -442,18 +489,63 @@ async def setrule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mx = coin_to_milli(context.args[3])
         en = context.args[4] == "1"
         if p < 0 or p > 1:
-            raise ValueError("概率范围")
+            raise ValueError("概率范围错误")
         if mn <= 0 or mx < mn:
-            raise ValueError("金额范围")
+            raise ValueError("金额范围错误")
     except:
         await update.message.reply_text("参数错误，请检查")
         return
 
     n = set_rule(chat_id, rid, p, mn, mx, en)
-    if n == 0:
-        await update.message.reply_text("规则ID不存在")
-    else:
-        await update.message.reply_text("规则已更新")
+    await update.message.reply_text("规则已更新" if n > 0 else "规则ID不存在")
+
+# ---- owner 管理员管理命令 ----
+async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    operator = update.effective_user.id
+    if not is_owner(operator):
+        await update.message.reply_text("只有 owner 可添加管理员")
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/addadmin 用户ID")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("用户ID必须是数字")
+        return
+    ok, msg = add_admin(operator, uid)
+    await update.message.reply_text(msg if ok else f"失败：{msg}")
+
+async def deladmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    operator = update.effective_user.id
+    if not is_owner(operator):
+        await update.message.reply_text("只有 owner 可删除管理员")
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/deladmin 用户ID")
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("用户ID必须是数字")
+        return
+    ok, msg = del_admin(operator, uid)
+    await update.message.reply_text(msg if ok else f"失败：{msg}")
+
+async def listadmins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    operator = update.effective_user.id
+    if not is_admin(operator):
+        await update.message.reply_text("你不是管理员")
+        return
+    rows = list_admins()
+    if not rows:
+        await update.message.reply_text("暂无管理员")
+        return
+    lines = ["👮 管理员列表："]
+    for uid, is_owner_flag, _created in rows:
+        lines.append(f"{uid} | {'OWNER' if is_owner_flag else 'ADMIN'}")
+    await update.message.reply_text("\n".join(lines))
+
 
 async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
@@ -477,17 +569,13 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rules = get_rules(chat_id)
     total = 0
-
-    # 多奖池独立抽取（可叠加）
-    for r in rules:
-        _, _name, p, mn, mx, _en, _pr = r
+    for _id, _name, p, mn, mx, _en, _pr in rules:
         if random.random() < p:
             total += random.randint(int(mn), int(mx))
 
     if total <= 0:
         return
 
-    # 再检查每日上限（严格一点）
     daily_key = f"daily:{chat_id}:{user_id}"
     got = int(rds.get(daily_key) or 0)
     allow = max(0, DAILY_MAX_MILLI - got)
@@ -498,29 +586,36 @@ async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet_add(chat_id, user_id, grant)
     add_daily_reward(chat_id, user_id, grant)
 
-    await update.message.reply_text(
-        f"🎉 {update.effective_user.first_name} 获得 {milli_to_coin(grant)} 金币"
-    )
+    await update.message.reply_text(f"🎉 {update.effective_user.first_name} 获得 {milli_to_coin(grant)} 金币")
 
 
 def main():
     init_db()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # 用户命令
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("coins", coins))
     app.add_handler(CommandHandler("shop", shop))
     app.add_handler(CommandHandler("buy", buy))
+
+    # 管理员命令
     app.add_handler(CommandHandler("additem", additem_cmd))
     app.add_handler(CommandHandler("listrules", listrules_cmd))
     app.add_handler(CommandHandler("setrule", setrule_cmd))
 
+    # owner 命令
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    app.add_handler(CommandHandler("deladmin", deladmin_cmd))
+    app.add_handler(CommandHandler("listadmins", listadmins_cmd))
+
+    # 群消息监听
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_group_text))
 
     if WEBHOOK_URL:
-        # Webhook 生产模式（推荐 Zeabur）
         full_url = WEBHOOK_URL.rstrip("/") + WEBHOOK_PATH
-        logger.info(f"Start webhook at {full_url}")
+        logger.info("Webhook mode: %s", full_url)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -528,10 +623,8 @@ def main():
             url_path=WEBHOOK_PATH.lstrip("/")
         )
     else:
-        # 本地调试
-        logger.info("Start polling mode")
+        logger.warning("WEBHOOK_URL 未设置，回退 polling（不推荐生产）")
         app.run_polling()
-
 
 if __name__ == "__main__":
     main()
