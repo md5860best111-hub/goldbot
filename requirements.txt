@@ -1,4 +1,4 @@
-python-telegram-bot==21.6
+python-telegram-bot[webhooks]==21.6
 psycopg[binary]==3.2.13
 psycopg-pool==3.2.6
 redis==5.0.8
