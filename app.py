@@ -535,7 +535,8 @@ def selected_chat_title(context: ContextTypes.DEFAULT_TYPE):
 
 def ensure_admin_selected_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     cid = selected_chat_id(context)
-    if cid <= 0:
+    # 群/超群 chat_id 允许负数，0 表示未选择
+    if cid == 0:
         return False, "请先选择管理群组"
     # root 放行（前提：用户已选择了群）
     if is_root_admin(user_id):
@@ -924,13 +925,13 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("v3:selgroup:"):
-            await q.answer()
-            clear_pending_state(context)
-
             cid = safe_int(data.split(":")[2], 0)
-            if cid <= 0 or not is_chat_admin(cid, uid):
+            if cid == 0 or not is_chat_admin(cid, uid):
                 await q.answer("无权限选择该群", show_alert=True)
                 return
+
+            await q.answer()
+            clear_pending_state(context)
 
             context.user_data["sel_chat_id"] = cid
             chats = {c[0]: c[1] for c in list_user_admin_chats(uid)}
