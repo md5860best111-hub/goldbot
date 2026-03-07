@@ -696,9 +696,26 @@ def kb_item_edit(item_id: int):
         [InlineKeyboardButton("🔙 返回商品列表", callback_data="v3:adm_shop:0")]
     ])
 
+def kb_user_panel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 兑换商品", callback_data="v3:u:shop:0"),
+         InlineKeyboardButton("🧾 金币记录", callback_data="v3:u:logs:0")],
+        [InlineKeyboardButton("🔄 刷新余额", callback_data="v3:u:refresh")]
+    ])
+
+def user_panel_text(chat_id: int, user_id: int):
+    bal = wallet_get(chat_id, user_id)
+    return (
+        "🛍️ 用户面板（当前群）\n"
+        f"用户ID：{user_id}\n"
+        f"当前余额：{milli_to_coin(bal)} 金币\n\n"
+        "可进行兑换、查看金币记录。"
+    )
+
 # =========================
 # Commands
 # =========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -733,6 +750,37 @@ async def safe_edit(q, text, reply_markup=None):
             await q.message.reply_text(text=text, reply_markup=reply_markup)
         except Exception:
             logger.exception("safe_edit second fallback failed")
+
+async def _job_delete_msg(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    if not job:
+        return
+    data = job.data or {}
+    chat_id = data.get("chat_id")
+    message_id = data.get("message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.exception("delete message failed: chat_id=%s message_id=%s", chat_id, message_id)
+
+async def auto_delete_pair(context: ContextTypes.DEFAULT_TYPE, chat_id: int, trigger_mid: int, bot_mid: int, delay: int = 60):
+    try:
+        context.application.job_queue.run_once(
+            _job_delete_msg,
+            when=delay,
+            data={"chat_id": chat_id, "message_id": trigger_mid},
+            name=f"del_trigger_{chat_id}_{trigger_mid}"
+        )
+        context.application.job_queue.run_once(
+            _job_delete_msg,
+            when=delay,
+            data={"chat_id": chat_id, "message_id": bot_mid},
+            name=f"del_bot_{chat_id}_{bot_mid}"
+        )
+    except Exception:
+        logger.exception("schedule auto delete pair failed")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error: %s", context.error)
@@ -963,6 +1011,72 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             await safe_edit(q, console_text(context, uid), reply_markup=kb_console())
+            return
+
+        # ===== 用户面板回调（不需要管理员权限）=====
+        if data == "v3:u:refresh":
+            await q.answer()
+            chat_id = q.message.chat_id
+            await safe_edit(q, user_panel_text(chat_id, uid), reply_markup=kb_user_panel())
+            return
+
+        if data.startswith("v3:u:shop:"):
+            await q.answer()
+            chat_id = q.message.chat_id
+            page = max(0, safe_int(data.split(":")[3], 0))
+            total = shop_count(chat_id)
+            max_page = max(0, (total - 1) // SHOP_SIZE) if total > 0 else 0
+            page = clamp(page, 0, max_page)
+            items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
+
+            if not items:
+                txt = "🎁 商城（当前群）\n暂无可兑换商品"
+            else:
+                lines = ["🎁 商城（当前群）"]
+                for item_id, title, price, stock, enabled in items:
+                    if not enabled:
+                        continue
+                    lines.append(f"ID{item_id}｜{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
+                txt = "\n".join(lines)
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️", callback_data=f"v3:u:shop:{max(0, page - 1)}"),
+                 InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+                 InlineKeyboardButton("➡️", callback_data=f"v3:u:shop:{min(max_page, page + 1)}")],
+                [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
+            ])
+            await safe_edit(q, txt, reply_markup=kb)
+            return
+
+        if data.startswith("v3:u:logs:"):
+            await q.answer()
+            chat_id = q.message.chat_id
+            page = max(0, safe_int(data.split(":")[3], 0))
+
+            # 仅看自己记录
+            rows = coin_logs_page(chat_id, 100, 0)
+            mine = [x for x in rows if int(x[2]) == int(uid)]
+            total = len(mine)
+            max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
+            page = clamp(page, 0, max_page)
+            part = mine[page * LOG_SIZE:(page + 1) * LOG_SIZE]
+
+            if not part:
+                txt = "🧾 你的金币记录（当前群）\n暂无记录"
+            else:
+                lines = ["🧾 你的金币记录（当前群）"]
+                for lid, op, u, d, reason, ct in part:
+                    sign = "+" if d >= 0 else ""
+                    lines.append(f"#{lid} | {sign}{milli_to_coin(d)} | {reason}")
+                txt = "\n".join(lines)
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️", callback_data=f"v3:u:logs:{max(0, page - 1)}"),
+                 InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+                 InlineKeyboardButton("➡️", callback_data=f"v3:u:logs:{min(max_page, page + 1)}")],
+                [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
+            ])
+            await safe_edit(q, txt[:3900], reply_markup=kb)
             return
 
         ok, v = ensure_admin_selected_chat(uid, context)
@@ -1298,6 +1412,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if chat.type in ("group", "supergroup") and not user.is_bot:
+        # 关键词唤起用户面板（双向60秒自毁）
+        if text in ("商城", "商店", "兑换"):
+            bot_msg = await update.message.reply_text(
+                user_panel_text(chat_id, user_id),
+                reply_markup=kb_user_panel()
+            )
+            try:
+                await auto_delete_pair(
+                    context=context,
+                    chat_id=chat_id,
+                    trigger_mid=update.message.message_id,
+                    bot_mid=bot_msg.message_id,
+                    delay=60
+                )
+            except Exception:
+                logger.exception("auto_delete_pair failed")
+            return
+
         if text.startswith("/"):
             return
         if not valid_text_basic(text, MIN_TEXT_LEN):
