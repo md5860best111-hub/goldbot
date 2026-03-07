@@ -1,0 +1,40 @@
+services:
+  app:
+    source:
+      git: .
+    build:
+      type: python
+    run:
+      command: python app.py
+    ports:
+      - port: 8080
+        type: http
+    env:
+      - key: WEBHOOK_PATH
+        value: /telegram/webhook
+      - key: OWNER_IDS
+        value: 631234269,6376186830
+      - key: MIN_TEXT_LEN
+        value: "5"
+      - key: COOLDOWN_SECONDS
+        value: "20"
+      - key: DAILY_MAX_MILLI
+        value: "50000"
+      - key: ENABLE_SAME_TEXT_BLOCK
+        value: "1"
+      # 下面两项如果平台支持 service binding/引用，会自动注入；不支持就手填
+      - key: DATABASE_URL
+        value: ${postgres.DATABASE_URL}
+      - key: REDIS_URL
+        value: ${redis.REDIS_URL}
+
+  postgres:
+    type: postgresql
+    # 如果支持磁盘配置可加（不同工作区字段名可能不同）
+    # volumes:
+    #   - name: data
+    #     mountPath: /var/lib/postgresql/data
+    #     size: 10Gi
+
+  redis:
+    type: redis
