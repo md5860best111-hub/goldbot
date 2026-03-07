@@ -287,6 +287,13 @@ def ensure_default_rules(conn, chat_id: int):
             """, (chat_id, chat_id, chat_id))
 
 @with_conn
+def migrate_rule_names_to_cn(conn):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE drop_rules SET name='普通红包' WHERE lower(name) IN ('common','normal')")
+        cur.execute("UPDATE drop_rules SET name='稀有红包' WHERE lower(name)='rare'")
+        cur.execute("UPDATE drop_rules SET name='史诗红包' WHERE lower(name)='epic'")
+
+@with_conn
 def list_rules(conn, chat_id: int, limit=20, offset=0):
     with conn.cursor() as cur:
         cur.execute("""
@@ -1323,6 +1330,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def main():
     init_db()
+    migrate_rule_names_to_cn()
     logger.info("ROOT_ADMIN_IDS loaded: %s", sorted(list(ROOT_ADMIN_IDS)))
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
