@@ -1,0 +1,6 @@
+```txt
+python-telegram-bot[webhooks]==21.6
+psycopg2-binary==2.9.9
+redis==5.0.8
+python-dotenv==1.0.1
+```
