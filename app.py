@@ -5,12 +5,12 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlparse
 from functools import wraps
-from datetime import datetime, timezone
 
 from psycopg_pool import ConnectionPool
 import redis
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters, CallbackQueryHandler
@@ -326,6 +326,8 @@ def wallet_get(conn, chat_id: int, user_id: int) -> int:
 @with_conn
 def wallet_add(conn, chat_id: int, user_id: int, delta: int):
     with conn.cursor() as cur:
+        if delta < 0:
+            raise ValueError("wallet_add delta 必须 >= 0")
         cur.execute("""
         INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
         VALUES(%s,%s,%s,NOW())
@@ -388,6 +390,24 @@ def shop_page(conn, chat_id: int, limit=6, offset=0):
         LIMIT %s OFFSET %s
         """, (chat_id, limit, offset))
         return cur.fetchall()
+
+@with_conn
+def shop_count(conn, chat_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM shop_items WHERE chat_id=%s", (chat_id,))
+        return int(cur.fetchone()[0])
+
+@with_conn
+def rules_count(conn, chat_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM drop_rules WHERE chat_id=%s", (chat_id,))
+        return int(cur.fetchone()[0])
+
+@with_conn
+def logs_count(conn, chat_id: int) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM coin_logs WHERE chat_id=%s", (chat_id,))
+        return int(cur.fetchone()[0])
 
 @with_conn
 def get_item(conn, chat_id: int, item_id: int):
@@ -517,9 +537,17 @@ def ensure_admin_selected_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE)
     cid = selected_chat_id(context)
     if cid <= 0:
         return False, "请先选择管理群组"
+    # root 放行（前提：用户已选择了群）
+    if is_root_admin(user_id):
+        return True, cid
     if not is_chat_admin(cid, user_id):
         return False, "你不在该群管理员列表"
     return True, cid
+
+def clear_pending_state(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("await_target_input", None)
+    context.user_data.pop("await_rule_name", None)
+    context.user_data.pop("await_item_title", None)
 
 def console_text(context: ContextTypes.DEFAULT_TYPE, uid: int):
     cid = selected_chat_id(context)
@@ -541,15 +569,19 @@ def kb_home():
 def kb_groups(user_id: int, page: int):
     rows = []
     chats = list_user_admin_chats(user_id)
+    total = len(chats)
+    max_page = max(0, (total - 1) // 8) if total > 0 else 0
+    page = clamp(page, 0, max_page)
+
     start = page * 8
-    part = chats[start:start+8]
+    part = chats[start:start + 8]
     for cid, title in part:
         rows.append([InlineKeyboardButton(f"{title or cid}", callback_data=f"v3:selgroup:{cid}")])
 
     rows.append([
-        InlineKeyboardButton("⬅️", callback_data=f"v3:groups:{max(0, page-1)}"),
-        InlineKeyboardButton(f"第{page+1}页", callback_data="v3:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v3:groups:{page+1}")
+        InlineKeyboardButton("⬅️", callback_data=f"v3:groups:{max(0, page - 1)}"),
+        InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+        InlineKeyboardButton("➡️", callback_data=f"v3:groups:{min(max_page, page + 1)}")
     ])
     rows.append([
         InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid"),
@@ -579,15 +611,20 @@ def kb_adm_user():
     ])
 
 def kb_adm_rules(chat_id: int, page: int):
+    total = rules_count(chat_id)
+    max_page = max(0, (total - 1) // RULE_SIZE) if total > 0 else 0
+    page = clamp(page, 0, max_page)
+
     rs = list_rules(chat_id, RULE_SIZE, page * RULE_SIZE)
     rows = []
     for r in rs:
         rid = r[0]
         rows.append([InlineKeyboardButton(fmt_rule_row(r), callback_data=f"v3:adm_rule:{rid}")])
+
     rows.append([
-        InlineKeyboardButton("⬅️", callback_data=f"v3:adm_rules:{max(0,page-1)}"),
-        InlineKeyboardButton(f"第{page+1}页", callback_data="v3:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v3:adm_rules:{page+1}")
+        InlineKeyboardButton("⬅️", callback_data=f"v3:adm_rules:{max(0, page - 1)}"),
+        InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+        InlineKeyboardButton("➡️", callback_data=f"v3:adm_rules:{min(max_page, page + 1)}")
     ])
     rows.append([InlineKeyboardButton("🔙 返回控制台", callback_data="v3:admin_home")])
     return InlineKeyboardMarkup(rows)
@@ -605,15 +642,23 @@ def kb_rule_edit(rid: int):
         [InlineKeyboardButton("🔙 返回规则列表", callback_data="v3:adm_rules:0")]
     ])
 
-def kb_logs(page: int):
+def kb_logs(chat_id: int, page: int):
+    total = logs_count(chat_id)
+    max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
+    page = clamp(page, 0, max_page)
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️", callback_data=f"v3:logs:{max(0,page-1)}"),
-         InlineKeyboardButton(f"第{page+1}页", callback_data="v3:noop"),
-         InlineKeyboardButton("➡️", callback_data=f"v3:logs:{page+1}")],
+        [InlineKeyboardButton("⬅️", callback_data=f"v3:logs:{max(0, page - 1)}"),
+         InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+         InlineKeyboardButton("➡️", callback_data=f"v3:logs:{min(max_page, page + 1)}")],
         [InlineKeyboardButton("🔙 返回控制台", callback_data="v3:admin_home")]
     ])
 
 def kb_adm_shop(chat_id: int, page: int):
+    total = shop_count(chat_id)
+    max_page = max(0, (total - 1) // SHOP_SIZE) if total > 0 else 0
+    page = clamp(page, 0, max_page)
+
     items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
     rows = []
     for item_id, title, price, stock, enabled in items:
@@ -621,10 +666,11 @@ def kb_adm_shop(chat_id: int, page: int):
             f"{'✅' if enabled else '❌'} ID{item_id} {title[:10]}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}",
             callback_data=f"v3:adm_item:{item_id}"
         )])
+
     rows.append([
-        InlineKeyboardButton("⬅️", callback_data=f"v3:adm_shop:{max(0,page-1)}"),
-        InlineKeyboardButton(f"第{page+1}页", callback_data="v3:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v3:adm_shop:{page+1}")
+        InlineKeyboardButton("⬅️", callback_data=f"v3:adm_shop:{max(0, page - 1)}"),
+        InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+        InlineKeyboardButton("➡️", callback_data=f"v3:adm_shop:{min(max_page, page + 1)}")
     ])
     rows.append([InlineKeyboardButton("➕新增商品（/additem 标题|价格|库存）", callback_data="v3:noop")])
     rows.append([InlineKeyboardButton("🔙 返回控制台", callback_data="v3:admin_home")])
@@ -648,13 +694,45 @@ def kb_item_edit(item_id: int):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-    # 强制每次 /start 重新选群，避免误操作到旧群
     context.user_data.pop("sel_chat_id", None)
     context.user_data.pop("sel_chat_title", None)
+    clear_pending_state(context)
     await update.message.reply_text(
         "📋 管理面板\n请先选择你要管理的群组：",
         reply_markup=kb_home()
     )
+
+async def safe_edit(q, text, reply_markup=None):
+    try:
+        await q.edit_message_text(text=text, reply_markup=reply_markup)
+    except BadRequest as e:
+        msg = str(e)
+        if "Message is not modified" in msg:
+            return
+        if "message can't be edited" in msg or "message to edit not found" in msg:
+            try:
+                await q.message.reply_text(text=text, reply_markup=reply_markup)
+            except Exception:
+                logger.exception("safe_edit fallback reply failed")
+            return
+        try:
+            await q.message.reply_text(text=text, reply_markup=reply_markup)
+        except Exception:
+            logger.exception("safe_edit fallback reply failed")
+    except Exception:
+        logger.exception("safe_edit failed")
+        try:
+            await q.message.reply_text(text=text, reply_markup=reply_markup)
+        except Exception:
+            logger.exception("safe_edit second fallback failed")
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("⚠️ 内部错误，已记录日志，请稍后重试。")
+    except Exception:
+        pass
 
 async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -675,6 +753,12 @@ async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"is_root={root}\nis_chat_admin_here={cadm}\nselected_chat_id={sel}"
     )
 
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    clear_pending_state(context)
+    await update.message.reply_text("已取消当前输入流程。")
+
 async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
@@ -690,16 +774,21 @@ async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await update.message.reply_text("用法：/additem 标题 | 价格 | 库存(可选)")
         return
+
     title = parts[0]
     try:
         price = coin_to_milli(parts[1])
     except Exception:
         await update.message.reply_text("价格格式错误")
         return
+
     stock = None
     if len(parts) >= 3 and parts[2]:
         try:
             stock = int(parts[2])
+            if stock < 0:
+                await update.message.reply_text("库存不能小于0")
+                return
         except Exception:
             await update.message.reply_text("库存必须是整数")
             return
@@ -730,6 +819,7 @@ async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group", "supergroup"):
         await update.message.reply_text("请在目标群里使用")
         return
+
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or str(chat_id)
     upsert_chat(chat_id, chat_title)
@@ -751,6 +841,7 @@ async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target <= 0:
         await update.message.reply_text("用户ID错误")
         return
+
     add_chat_admin(chat_id, target, "admin")
     await update.message.reply_text(f"已授权 {target} 为本群管理员")
 
@@ -760,12 +851,14 @@ async def unbind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group", "supergroup"):
         await update.message.reply_text("请在目标群里使用")
         return
+
     chat_id = update.effective_chat.id
     operator = update.effective_user.id
     allowed = is_root_admin(operator) or is_chat_admin(chat_id, operator)
     if not allowed:
         await update.message.reply_text("无权限：仅根管理员或本群管理员可移除")
         return
+
     if not context.args:
         await update.message.reply_text("用法：/unbind_admin 用户ID")
         return
@@ -773,6 +866,7 @@ async def unbind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target <= 0:
         await update.message.reply_text("用户ID错误")
         return
+
     ok, msg = del_chat_admin(chat_id, target)
     await update.message.reply_text(msg)
 
@@ -783,306 +877,337 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.message or not update.effective_user:
         return
-    await q.answer()
-    data = q.data or ""
-    uid = update.effective_user.id
 
-    if data == "v3:noop":
-        return
+    try:
+        data = q.data or ""
+        uid = update.effective_user.id
+        logger.info("CB data=%s uid=%s chat_id=%s", data, uid, q.message.chat_id if q.message else None)
 
-    if data == "v3:show_myid":
-        await q.answer(f"你的ID: {uid}", show_alert=True)
-        return
-
-    if data == "v3:home":
-        await q.edit_message_text(
-            "📋 管理面板\n请先选择你要管理的群组：",
-            reply_markup=kb_home()
-        )
-        return
-
-    if data.startswith("v3:groups:"):
-        page = max(0, safe_int(data.split(":")[2], 0))
-        chats = list_user_admin_chats(uid)
-        if not chats:
-            await q.edit_message_text(
-                "🗂️ 你还没有可管理的群\n\n"
-                "请在目标群由 root 或现管理员执行：\n"
-                "/bind_admin 你的用户ID\n\n"
-                "先发 /myid 获取你的ID",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid")],
-                    [InlineKeyboardButton("🔄 刷新", callback_data="v3:groups:0")],
-                    [InlineKeyboardButton("🏠 返回首页", callback_data="v3:home")]
-                ])
-            )
+        if data == "v3:noop":
+            await q.answer()
             return
 
-        await q.edit_message_text(
-            "🗂️ 请选择管理群组（选择后才会显示管理功能）",
-            reply_markup=kb_groups(uid, page)
-        )
-        return
-
-    if data.startswith("v3:selgroup:"):
-        cid = safe_int(data.split(":")[2], 0)
-        if cid <= 0 or not is_chat_admin(cid, uid):
-            await q.answer("无权限选择该群", show_alert=True)
+        if data == "v3:show_myid":
+            await q.answer(f"你的ID: {uid}", show_alert=True)
+            try:
+                await q.message.reply_text(f"🆔 你的用户ID：{uid}")
+            except Exception:
+                logger.exception("reply myid failed")
             return
-        context.user_data["sel_chat_id"] = cid
-        chats = {c[0]: c[1] for c in list_user_admin_chats(uid)}
-        context.user_data["sel_chat_title"] = chats.get(cid, str(cid))
-        ensure_default_rules(cid)
-        await q.edit_message_text(console_text(context, uid), reply_markup=kb_console())
-        return
 
-    if data == "v3:admin_home":
+        if data == "v3:home":
+            await q.answer()
+            clear_pending_state(context)
+            await safe_edit(q, "📋 管理面板\n请先选择你要管理的群组：", reply_markup=kb_home())
+            return
+
+        if data.startswith("v3:groups:"):
+            await q.answer()
+            clear_pending_state(context)
+            page = max(0, safe_int(data.split(":")[2], 0))
+            chats = list_user_admin_chats(uid)
+            if not chats:
+                await safe_edit(
+                    q,
+                    "🗂️ 你还没有可管理的群\n\n"
+                    "请在目标群由 root 或现管理员执行：\n"
+                    "/bind_admin 你的用户ID\n\n"
+                    "先发 /myid 获取你的ID",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid")],
+                        [InlineKeyboardButton("🔄 刷新", callback_data="v3:groups:0")],
+                        [InlineKeyboardButton("🏠 返回首页", callback_data="v3:home")]
+                    ])
+                )
+                return
+            await safe_edit(q, "🗂️ 请选择管理群组（选择后才会显示管理功能）", reply_markup=kb_groups(uid, page))
+            return
+
+        if data.startswith("v3:selgroup:"):
+            await q.answer()
+            clear_pending_state(context)
+
+            cid = safe_int(data.split(":")[2], 0)
+            if cid <= 0 or not is_chat_admin(cid, uid):
+                await q.answer("无权限选择该群", show_alert=True)
+                return
+
+            context.user_data["sel_chat_id"] = cid
+            chats = {c[0]: c[1] for c in list_user_admin_chats(uid)}
+            context.user_data["sel_chat_title"] = chats.get(cid, str(cid))
+            ensure_default_rules(cid)
+
+            await safe_edit(q, console_text(context, uid), reply_markup=kb_console())
+            return
+
+        if data == "v3:admin_home":
+            await q.answer()
+            clear_pending_state(context)
+            ok, v = ensure_admin_selected_chat(uid, context)
+            if not ok:
+                await safe_edit(
+                    q,
+                    "你还没有选择管理群组，请先选择：",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗂️ 选择管理群组", callback_data="v3:groups:0")],
+                        [InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid")]
+                    ])
+                )
+                return
+            await safe_edit(q, console_text(context, uid), reply_markup=kb_console())
+            return
+
         ok, v = ensure_admin_selected_chat(uid, context)
         if not ok:
-            await q.edit_message_text(
-                "你还没有选择管理群组，请先选择：",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🗂️ 选择管理群组", callback_data="v3:groups:0")],
-                    [InlineKeyboardButton("🆔 我的ID", callback_data="v3:show_myid")]
-                ])
+            await q.answer(v, show_alert=True)
+            return
+        chat_id = v
+
+        if data == "v3:adm_list":
+            await q.answer()
+            rows = list_chat_admins(chat_id)
+            txt = "🛡️ 本群管理员列表：\n" + "\n".join([f"- {x[0]} ({x[1]})" for x in rows]) if rows else "暂无管理员"
+            await safe_edit(q, txt, reply_markup=kb_console())
+            return
+
+        if data == "v3:adm_user":
+            await q.answer()
+            context.user_data.setdefault("adm_target", uid)
+            context.user_data.setdefault("adm_step", 1000)
+            t = context.user_data["adm_target"]
+            s = context.user_data["adm_step"]
+            bal = wallet_get(chat_id, t)
+            await safe_edit(q, f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(s)}\n目标余额：{milli_to_coin(bal)}", reply_markup=kb_adm_user())
+            return
+
+        if data == "v3:adm_target":
+            await q.answer()
+            context.user_data["await_target_input"] = True
+            await safe_edit(q, "请输入目标用户ID（纯数字）\n发送 /cancel 可取消")
+            return
+
+        if data == "v3:adm_step":
+            await q.answer()
+            cur = context.user_data.get("adm_step", 1000)
+            idx = STEP_OPTIONS.index(cur) if cur in STEP_OPTIONS else 2
+            idx = (idx + 1) % len(STEP_OPTIONS)
+            context.user_data["adm_step"] = STEP_OPTIONS[idx]
+            t = context.user_data.get("adm_target", uid)
+            bal = wallet_get(chat_id, t)
+            await safe_edit(q, f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(context.user_data['adm_step'])}\n目标余额：{milli_to_coin(bal)}", reply_markup=kb_adm_user())
+            return
+
+        if data == "v3:adm_qbal":
+            t = context.user_data.get("adm_target", uid)
+            bal = wallet_get(chat_id, t)
+            await q.answer(f"用户 {t} 当前群余额：{milli_to_coin(bal)}", show_alert=True)
+            return
+
+        if data in ("v3:adm_add", "v3:adm_sub"):
+            t = context.user_data.get("adm_target", uid)
+            s = context.user_data.get("adm_step", 1000)
+            delta = s if data == "v3:adm_add" else -s
+            ok2, msg = wallet_adjust_admin(chat_id, uid, t, delta, "panel_adjust")
+            await q.answer(msg[:180], show_alert=True)
+            bal = wallet_get(chat_id, t)
+            await safe_edit(q, f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(s)}\n目标余额：{milli_to_coin(bal)}", reply_markup=kb_adm_user())
+            return
+
+        if data.startswith("v3:logs:"):
+            await q.answer()
+            page = max(0, safe_int(data.split(":")[2], 0))
+            total = logs_count(chat_id)
+            max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
+            page = clamp(page, 0, max_page)
+
+            rows = coin_logs_page(chat_id, LOG_SIZE, page * LOG_SIZE)
+            if not rows:
+                txt = "🧾 本群暂无管理员操作日志"
+            else:
+                lines = ["🧾 本群管理员操作日志："]
+                for lid, op, u, d, reason, ct in rows:
+                    sign = "+" if d >= 0 else ""
+                    lines.append(f"#{lid} | {op}->{u} | {sign}{milli_to_coin(d)} | {reason}")
+                txt = "\n".join(lines)
+            await safe_edit(q, txt[:3900], reply_markup=kb_logs(chat_id, page))
+            return
+
+        if data.startswith("v3:adm_rules:"):
+            await q.answer()
+            page = max(0, safe_int(data.split(":")[2], 0))
+            ensure_default_rules(chat_id)
+            await safe_edit(q, "⚙️ 规则管理（仅当前群）\n说明：概率与区间只影响当前群。", reply_markup=kb_adm_rules(chat_id, page))
+            return
+
+        if data.startswith("v3:adm_rule:"):
+            await q.answer()
+            rid = safe_int(data.split(":")[2], 0)
+            r = get_rule(chat_id, rid)
+            if not r:
+                await q.answer("规则不存在", show_alert=True)
+                return
+            _id, name, p, mn, mx, en, pr = r
+            txt = (
+                f"⚙️ 编辑规则（当前群）\n"
+                f"名称：{name}\n概率：{p*100:.3f}%\n"
+                f"最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n"
+                f"状态：{'开启' if en else '关闭'}"
             )
+            await safe_edit(q, txt, reply_markup=kb_rule_edit(rid))
             return
-        await q.edit_message_text(console_text(context, uid), reply_markup=kb_console())
-        return
 
-    ok, v = ensure_admin_selected_chat(uid, context)
-    if not ok:
-        await q.answer(v, show_alert=True)
-        return
-    chat_id = v
-
-    if data == "v3:adm_list":
-        rows = list_chat_admins(chat_id)
-        txt = "🛡️ 本群管理员列表：\n" + "\n".join([f"- {x[0]} ({x[1]})" for x in rows]) if rows else "暂无管理员"
-        await q.edit_message_text(txt, reply_markup=kb_console())
-        return
-
-    if data == "v3:adm_user":
-        context.user_data.setdefault("adm_target", uid)
-        context.user_data.setdefault("adm_step", 1000)
-        t = context.user_data["adm_target"]
-        s = context.user_data["adm_step"]
-        bal = wallet_get(chat_id, t)
-        await q.edit_message_text(
-            f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(s)}\n目标余额：{milli_to_coin(bal)}",
-            reply_markup=kb_adm_user()
-        )
-        return
-
-    if data == "v3:adm_target":
-        context.user_data["await_target_input"] = True
-        await q.edit_message_text("请输入目标用户ID（纯数字）")
-        return
-
-    if data == "v3:adm_step":
-        cur = context.user_data.get("adm_step", 1000)
-        idx = STEP_OPTIONS.index(cur) if cur in STEP_OPTIONS else 2
-        idx = (idx + 1) % len(STEP_OPTIONS)
-        context.user_data["adm_step"] = STEP_OPTIONS[idx]
-        t = context.user_data.get("adm_target", uid)
-        bal = wallet_get(chat_id, t)
-        await q.edit_message_text(
-            f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(context.user_data['adm_step'])}\n目标余额：{milli_to_coin(bal)}",
-            reply_markup=kb_adm_user()
-        )
-        return
-
-    if data == "v3:adm_qbal":
-        t = context.user_data.get("adm_target", uid)
-        bal = wallet_get(chat_id, t)
-        await q.answer(f"用户 {t} 当前群余额：{milli_to_coin(bal)}", show_alert=True)
-        return
-
-    if data in ("v3:adm_add", "v3:adm_sub"):
-        t = context.user_data.get("adm_target", uid)
-        s = context.user_data.get("adm_step", 1000)
-        delta = s if data == "v3:adm_add" else -s
-        ok2, msg = wallet_adjust_admin(chat_id, uid, t, delta, "panel_adjust")
-        await q.answer(msg[:180], show_alert=True)
-        bal = wallet_get(chat_id, t)
-        await q.edit_message_text(
-            f"👤 金币管理（仅当前群）\n目标用户：{t}\n步进：{milli_to_coin(s)}\n目标余额：{milli_to_coin(bal)}",
-            reply_markup=kb_adm_user()
-        )
-        return
-
-    if data.startswith("v3:logs:"):
-        page = max(0, safe_int(data.split(":")[2], 0))
-        rows = coin_logs_page(chat_id, LOG_SIZE, page * LOG_SIZE)
-        if not rows:
-            txt = "🧾 本群暂无管理员操作日志"
-        else:
-            lines = ["🧾 本群管理员操作日志："]
-            for lid, op, u, d, reason, ct in rows:
-                sign = "+" if d >= 0 else ""
-                lines.append(f"#{lid} | {op}->{u} | {sign}{milli_to_coin(d)} | {reason}")
-            txt = "\n".join(lines)
-        await q.edit_message_text(txt[:3900], reply_markup=kb_logs(page))
-        return
-
-    if data.startswith("v3:adm_rules:"):
-        page = max(0, safe_int(data.split(":")[2], 0))
-        ensure_default_rules(chat_id)
-        await q.edit_message_text(
-            "⚙️ 规则管理（仅当前群）\n说明：概率与区间只影响当前群。",
-            reply_markup=kb_adm_rules(chat_id, page)
-        )
-        return
-
-    if data.startswith("v3:adm_rule:"):
-        rid = safe_int(data.split(":")[2], 0)
-        r = get_rule(chat_id, rid)
-        if not r:
-            await q.answer("规则不存在", show_alert=True)
+        if data.startswith("v3:r:name:"):
+            await q.answer()
+            rid = safe_int(data.split(":")[3], 0)
+            context.user_data["await_rule_name"] = rid
+            await safe_edit(q, f"请输入规则 ID{rid} 的新中文名称（1~32字）\n发送 /cancel 可取消")
             return
-        _id, name, p, mn, mx, en, pr = r
-        txt = (
-            f"⚙️ 编辑规则（当前群）\n"
-            f"名称：{name}\n概率：{p*100:.3f}%\n"
-            f"最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n"
-            f"状态：{'开启' if en else '关闭'}"
-        )
-        await q.edit_message_text(txt, reply_markup=kb_rule_edit(rid))
-        return
 
-    if data.startswith("v3:r:name:"):
-        rid = safe_int(data.split(":")[3], 0)
-        context.user_data["await_rule_name"] = rid
-        await q.edit_message_text(f"请输入规则 ID{rid} 的新中文名称（1~32字）")
-        return
-
-    if data.startswith("v3:r:toggle:"):
-        rid = safe_int(data.split(":")[3], 0)
-        r = get_rule(chat_id, rid)
-        if not r:
-            await q.answer("规则不存在", show_alert=True)
+        if data.startswith("v3:r:toggle:"):
+            await q.answer()
+            rid = safe_int(data.split(":")[3], 0)
+            r = get_rule(chat_id, rid)
+            if not r:
+                await q.answer("规则不存在", show_alert=True)
+                return
+            _id, name, p, mn, mx, en, pr = r
+            update_rule(chat_id, rid, float(p), int(mn), int(mx), not bool(en), name)
+            nr = get_rule(chat_id, rid)
+            _id, name, p, mn, mx, en, pr = nr
+            txt = f"名称：{name}\n概率：{p*100:.3f}%\n最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n状态：{'开启' if en else '关闭'}"
+            await safe_edit(q, txt, reply_markup=kb_rule_edit(rid))
             return
-        _id, name, p, mn, mx, en, pr = r
-        update_rule(chat_id, rid, float(p), int(mn), int(mx), not bool(en), name)
-        nr = get_rule(chat_id, rid)
-        _id, name, p, mn, mx, en, pr = nr
-        txt = f"名称：{name}\n概率：{p*100:.3f}%\n最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n状态：{'开启' if en else '关闭'}"
-        await q.edit_message_text(txt, reply_markup=kb_rule_edit(rid))
-        return
 
-    if data.startswith("v3:r:p:") or data.startswith("v3:r:min:") or data.startswith("v3:r:max:"):
-        _, _, field, delta_s, rid_s = data.split(":")
-        rid = safe_int(rid_s, 0)
-        r = get_rule(chat_id, rid)
-        if not r:
-            await q.answer("规则不存在", show_alert=True)
+        if data.startswith("v3:r:p:") or data.startswith("v3:r:min:") or data.startswith("v3:r:max:"):
+            await q.answer()
+            _, _, field, delta_s, rid_s = data.split(":")
+            rid = safe_int(rid_s, 0)
+            r = get_rule(chat_id, rid)
+            if not r:
+                await q.answer("规则不存在", show_alert=True)
+                return
+            _id, name, p, mn, mx, en, pr = r
+            np, nmn, nmx = float(p), int(mn), int(mx)
+
+            if field == "p":
+                np = round(clamp(np + float(delta_s), 0.0, 1.0), 6)
+            elif field == "min":
+                nmn = max(1, nmn + safe_int(delta_s, 0))
+                if nmn > nmx:
+                    nmn = nmx
+            elif field == "max":
+                nmx = max(nmn, nmx + safe_int(delta_s, 0))
+
+            update_rule(chat_id, rid, np, nmn, nmx, bool(en), name)
+            nr = get_rule(chat_id, rid)
+            _id, name, p, mn, mx, en, pr = nr
+            txt = f"名称：{name}\n概率：{p*100:.3f}%\n最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n状态：{'开启' if en else '关闭'}"
+            await safe_edit(q, txt, reply_markup=kb_rule_edit(rid))
             return
-        _id, name, p, mn, mx, en, pr = r
-        np, nmn, nmx = float(p), int(mn), int(mx)
 
-        if field == "p":
-            np = round(clamp(np + float(delta_s), 0.0, 1.0), 6)
-        elif field == "min":
-            nmn = max(1, nmn + safe_int(delta_s, 0))
-            if nmn > nmx:
-                nmn = nmx
-        elif field == "max":
-            nmx = max(nmn, nmx + safe_int(delta_s, 0))
-
-        update_rule(chat_id, rid, np, nmn, nmx, bool(en), name)
-        nr = get_rule(chat_id, rid)
-        _id, name, p, mn, mx, en, pr = nr
-        txt = f"名称：{name}\n概率：{p*100:.3f}%\n最小：{milli_to_coin(mn)}\n最大：{milli_to_coin(mx)}\n状态：{'开启' if en else '关闭'}"
-        await q.edit_message_text(txt, reply_markup=kb_rule_edit(rid))
-        return
-
-    if data.startswith("v3:adm_shop:"):
-        page = max(0, safe_int(data.split(":")[2], 0))
-        await q.edit_message_text("🎁 商品管理（仅当前群）", reply_markup=kb_adm_shop(chat_id, page))
-        return
-
-    if data.startswith("v3:adm_item:"):
-        item_id = safe_int(data.split(":")[2], 0)
-        it = get_item(chat_id, item_id)
-        if not it:
-            await q.answer("商品不存在", show_alert=True)
+        if data.startswith("v3:adm_shop:"):
+            await q.answer()
+            page = max(0, safe_int(data.split(":")[2], 0))
+            await safe_edit(q, "🎁 商品管理（仅当前群）", reply_markup=kb_adm_shop(chat_id, page))
             return
-        _id, title, price, stock, enabled = it
-        txt = (
-            f"🎁 编辑商品（当前群）\n"
-            f"标题：{title}\n价格：{milli_to_coin(price)}\n"
-            f"库存：{'∞' if stock is None else stock}\n"
-            f"状态：{'上架' if enabled else '下架'}"
-        )
-        await q.edit_message_text(txt, reply_markup=kb_item_edit(item_id))
-        return
 
-    if data.startswith("v3:i:toggle:"):
-        item_id = safe_int(data.split(":")[3], 0)
-        it = get_item(chat_id, item_id)
-        if not it:
-            await q.answer("商品不存在", show_alert=True)
+        if data.startswith("v3:adm_item:"):
+            await q.answer()
+            item_id = safe_int(data.split(":")[2], 0)
+            it = get_item(chat_id, item_id)
+            if not it:
+                await q.answer("商品不存在", show_alert=True)
+                return
+            _id, title, price, stock, enabled = it
+            txt = (
+                f"🎁 编辑商品（当前群）\n"
+                f"标题：{title}\n价格：{milli_to_coin(price)}\n"
+                f"库存：{'∞' if stock is None else stock}\n"
+                f"状态：{'上架' if enabled else '下架'}"
+            )
+            await safe_edit(q, txt, reply_markup=kb_item_edit(item_id))
             return
-        _id, title, price, stock, enabled = it
-        update_item(chat_id, item_id, title, int(price), stock, not bool(enabled))
-        nit = get_item(chat_id, item_id)
-        _id, title, price, stock, enabled = nit
-        txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
-        await q.edit_message_text(txt, reply_markup=kb_item_edit(item_id))
-        return
 
-    if data.startswith("v3:i:price:"):
-        _, _, _, delta_s, item_id_s = data.split(":")
-        item_id = safe_int(item_id_s, 0)
-        it = get_item(chat_id, item_id)
-        if not it:
-            await q.answer("商品不存在", show_alert=True)
+        if data.startswith("v3:i:toggle:"):
+            await q.answer()
+            item_id = safe_int(data.split(":")[3], 0)
+            it = get_item(chat_id, item_id)
+            if not it:
+                await q.answer("商品不存在", show_alert=True)
+                return
+            _id, title, price, stock, enabled = it
+            update_item(chat_id, item_id, title, int(price), stock, not bool(enabled))
+            nit = get_item(chat_id, item_id)
+            _id, title, price, stock, enabled = nit
+            txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
+            await safe_edit(q, txt, reply_markup=kb_item_edit(item_id))
             return
-        _id, title, price, stock, enabled = it
-        nprice = max(1, int(price) + safe_int(delta_s, 0))
-        update_item(chat_id, item_id, title, nprice, stock, bool(enabled))
-        nit = get_item(chat_id, item_id)
-        _id, title, price, stock, enabled = nit
-        txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
-        await q.edit_message_text(txt, reply_markup=kb_item_edit(item_id))
-        return
 
-    if data.startswith("v3:i:stock:"):
-        _, _, _, delta_s, item_id_s = data.split(":")
-        item_id = safe_int(item_id_s, 0)
-        it = get_item(chat_id, item_id)
-        if not it:
-            await q.answer("商品不存在", show_alert=True)
+        if data.startswith("v3:i:price:"):
+            await q.answer()
+            _, _, _, delta_s, item_id_s = data.split(":")
+            item_id = safe_int(item_id_s, 0)
+            it = get_item(chat_id, item_id)
+            if not it:
+                await q.answer("商品不存在", show_alert=True)
+                return
+            _id, title, price, stock, enabled = it
+            nprice = max(1, int(price) + safe_int(delta_s, 0))
+            update_item(chat_id, item_id, title, nprice, stock, bool(enabled))
+            nit = get_item(chat_id, item_id)
+            _id, title, price, stock, enabled = nit
+            txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
+            await safe_edit(q, txt, reply_markup=kb_item_edit(item_id))
             return
-        _id, title, price, stock, enabled = it
-        cur = 0 if stock is None else int(stock)
-        nstock = max(0, cur + safe_int(delta_s, 0))
-        update_item(chat_id, item_id, title, int(price), nstock, bool(enabled))
-        nit = get_item(chat_id, item_id)
-        _id, title, price, stock, enabled = nit
-        txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
-        await q.edit_message_text(txt, reply_markup=kb_item_edit(item_id))
-        return
 
-    if data.startswith("v3:i:stockinf:"):
-        item_id = safe_int(data.split(":")[3], 0)
-        it = get_item(chat_id, item_id)
-        if not it:
-            await q.answer("商品不存在", show_alert=True)
+        if data.startswith("v3:i:stock:"):
+            await q.answer()
+            _, _, _, delta_s, item_id_s = data.split(":")
+            item_id = safe_int(item_id_s, 0)
+            it = get_item(chat_id, item_id)
+            if not it:
+                await q.answer("商品不存在", show_alert=True)
+                return
+            _id, title, price, stock, enabled = it
+            cur = 0 if stock is None else int(stock)
+            nstock = max(0, cur + safe_int(delta_s, 0))
+            update_item(chat_id, item_id, title, int(price), nstock, bool(enabled))
+            nit = get_item(chat_id, item_id)
+            _id, title, price, stock, enabled = nit
+            txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
+            await safe_edit(q, txt, reply_markup=kb_item_edit(item_id))
             return
-        _id, title, price, stock, enabled = it
-        update_item(chat_id, item_id, title, int(price), None, bool(enabled))
-        nit = get_item(chat_id, item_id)
-        _id, title, price, stock, enabled = nit
-        txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
-        await q.edit_message_text(txt, reply_markup=kb_item_edit(item_id))
-        return
 
-    if data.startswith("v3:i:title:"):
-        item_id = safe_int(data.split(":")[3], 0)
-        context.user_data["await_item_title"] = item_id
-        await q.edit_message_text(f"请输入商品 ID{item_id} 新标题（1~40字）")
-        return
+        if data.startswith("v3:i:stockinf:"):
+            await q.answer()
+            item_id = safe_int(data.split(":")[3], 0)
+            it = get_item(chat_id, item_id)
+            if not it:
+                await q.answer("商品不存在", show_alert=True)
+                return
+            _id, title, price, stock, enabled = it
+            update_item(chat_id, item_id, title, int(price), None, bool(enabled))
+            nit = get_item(chat_id, item_id)
+            _id, title, price, stock, enabled = nit
+            txt = f"标题：{title}\n价格：{milli_to_coin(price)}\n库存：{'∞' if stock is None else stock}\n状态：{'上架' if enabled else '下架'}"
+            await safe_edit(q, txt, reply_markup=kb_item_edit(item_id))
+            return
+
+        if data.startswith("v3:i:title:"):
+            await q.answer()
+            item_id = safe_int(data.split(":")[3], 0)
+            context.user_data["await_item_title"] = item_id
+            await safe_edit(q, f"请输入商品 ID{item_id} 新标题（1~40字）\n发送 /cancel 可取消")
+            return
+
+        await q.answer("未识别操作", show_alert=False)
+
+    except Exception:
+        logger.exception("cb handler crashed")
+        try:
+            await q.message.reply_text("⚠️ 按钮处理失败，请重试。")
+        except Exception:
+            pass
 
 # =========================
 # Message handlers
@@ -1111,7 +1236,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             target = safe_int(text, 0)
             if target <= 0:
-                await update.message.reply_text("用户ID格式错误")
+                await update.message.reply_text("用户ID格式错误，发送 /cancel 可取消")
                 return
             context.user_data["adm_target"] = target
             context.user_data["await_target_input"] = False
@@ -1130,7 +1255,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rid = safe_int(context.user_data.get("await_rule_name"), 0)
             name = text[:32].strip()
             if not name:
-                await update.message.reply_text("名称不能为空")
+                await update.message.reply_text("名称不能为空，发送 /cancel 可取消")
                 return
             r = get_rule(v, rid)
             if not r:
@@ -1151,7 +1276,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item_id = safe_int(context.user_data.get("await_item_title"), 0)
             title = text[:40].strip()
             if not title:
-                await update.message.reply_text("标题不能为空")
+                await update.message.reply_text("标题不能为空，发送 /cancel 可取消")
                 return
             it = get_item(v, item_id)
             if not it:
@@ -1204,6 +1329,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("whoami", whoami_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("additem", additem_cmd))
     app.add_handler(CommandHandler("bind_admin", bind_admin_cmd))
@@ -1211,6 +1337,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(cb, pattern=r"^v3:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     try:
         if WEBHOOK_URL:
