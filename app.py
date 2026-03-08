@@ -936,7 +936,7 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ok:
         try:
-            await notify_admins_purchase(context, chat_id, update.effective_user.id, item_id)
+            await notify_purchase(context, chat_id, update.effective_user.id, item_id)
         except Exception:
             logger.exception("notify purchase failed in /buy")
 
@@ -1170,7 +1170,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if ok_buy:
                 try:
-                    await notify_admins_purchase(context, chat_id, uid, item_id)
+                    await notify_purchase(context, chat_id, uid, item_id)
                 except Exception:
                     logger.exception("notify purchase failed")
 
