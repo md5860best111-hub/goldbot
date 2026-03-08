@@ -1070,7 +1070,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = q.message.chat_id
             page = max(0, safe_int(data.split(":")[3], 0))
 
-            # 仅看自己记录
             rows = coin_logs_page(chat_id, 100, 0)
             mine = [x for x in rows if int(x[2]) == int(uid)]
             total = len(mine)
@@ -1096,6 +1095,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, txt[:3900], reply_markup=kb)
             return
 
+        # ===== 管理员区 =====
         ok, v = ensure_admin_selected_chat(uid, context)
         if not ok:
             await q.answer(v, show_alert=True)
@@ -1158,8 +1158,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total = logs_count(chat_id)
             max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
             page = clamp(page, 0, max_page)
-
             rows = coin_logs_page(chat_id, LOG_SIZE, page * LOG_SIZE)
+
             if not rows:
                 txt = "🧾 本群暂无管理员操作日志"
             else:
@@ -1250,7 +1250,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "🎁 商品管理（仅当前群）", reply_markup=kb_adm_shop(chat_id, page))
             return
 
-                if data == "v3:adm_additem_start":
+        if data == "v3:adm_additem_start":
             await q.answer()
             context.user_data["await_add_item_input"] = True
             await safe_edit(
@@ -1360,7 +1360,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("⚠️ 按钮处理失败，请重试。")
         except Exception:
             pass
-
 # =========================
 # Message handlers
 # =========================
@@ -1420,7 +1419,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"规则 ID{rid} 名称已更新为：{name}")
             return
 
-            if context.user_data.get("await_add_item_input"):
+        if context.user_data.get("await_add_item_input"):
             ok, v = ensure_admin_selected_chat(user_id, context)
             if not ok:
                 await update.message.reply_text(v)
@@ -1484,7 +1483,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if chat.type in ("group", "supergroup") and not user.is_bot:
-        # 关键词唤起用户面板（双向60秒自毁）
         if text in ("商城", "商店", "兑换"):
             bot_msg = await update.message.reply_text(
                 user_panel_text(chat_id, user_id),
@@ -1511,7 +1509,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rules = list_rules(chat_id, 100, 0)
         total = 0
-        hits = []  # [(name, amt)]
+        hits = []
         for rid, name, p, mn, mx, en, pr in rules:
             if not en:
                 continue
@@ -1532,9 +1530,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_daily(chat_id, user_id, grant)
 
         if hits:
-            top_name, top_amt = max(hits, key=lambda x: x[1])
+            top_name, _ = max(hits, key=lambda x: x[1])
         else:
-            top_name, top_amt = ("神秘红包", grant)
+            top_name = "神秘红包"
 
         flair = "🎉"
         if "锦鲤" in top_name:
