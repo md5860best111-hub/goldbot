@@ -9,8 +9,11 @@ from functools import wraps
 
 from psycopg_pool import ConnectionPool
 import redis
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+)
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -560,15 +563,30 @@ def selected_chat_title(context: ContextTypes.DEFAULT_TYPE):
 
 def ensure_admin_selected_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     cid = selected_chat_id(context)
-    # 群/超群 chat_id 允许负数，0 表示未选择
     if cid == 0:
         return False, "请先选择管理群组"
-    # root 放行（前提：用户已选择了群）
-    if is_root_admin(user_id):
-        return True, cid
     if not is_chat_admin(cid, user_id):
         return False, "你不在该群管理员列表"
     return True, cid
+
+def can_use_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    管理员命令统一鉴权：
+    - 必须是私聊触发
+    - 必须先在 /start 里选择管理群组
+    - 必须是该群绑定管理员（严格模式，root不越权）
+    返回: (ok: bool, chat_id_or_msg)
+    """
+    if not update.effective_chat or not update.effective_user:
+        return False, "上下文无效"
+    if update.effective_chat.type != "private":
+        return False, "管理员命令仅可在私聊使用"
+
+    uid = update.effective_user.id
+    ok, cid_or_msg = ensure_admin_selected_chat(uid, context)
+    if not ok:
+        return False, f"{cid_or_msg}\n\n请先私聊执行：/start -> 选择管理群组"
+    return True, cid_or_msg
 
 def clear_pending_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("await_target_input", None)
@@ -731,7 +749,81 @@ def user_panel_text(chat_id: int, user_id: int):
         "可进行兑换、查看金币记录。"
     )
 
-async def notify_admins_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buyer_id: int, item_id: int):
+async def refresh_private_commands_for_user(app, user_id: int):
+    """
+    动态设置某个用户在私聊中的命令菜单：
+    - 若该用户有可管理群 -> 显示管理员扩展命令
+    - 否则仅显示基础命令
+    """
+    try:
+        chats = list_user_admin_chats(user_id)
+        is_admin_user = len(chats) > 0
+
+        base_cmds = [
+            BotCommand("start", "打开面板"),
+            BotCommand("myid", "查看我的ID"),
+            BotCommand("whoami", "查看当前身份"),
+            BotCommand("cancel", "取消当前输入"),
+        ]
+
+        admin_cmds = [
+            BotCommand("additem", "新增商品：/additem 标题 | 价格 | 库存"),
+            BotCommand("bind_admin", "群内授权管理员：/bind_admin 用户ID"),
+            BotCommand("unbind_admin", "群内移除管理员：/unbind_admin 用户ID"),
+        ]
+
+        cmds = base_cmds + admin_cmds if is_admin_user else base_cmds
+
+        await app.bot.set_my_commands(
+            commands=cmds,
+            scope=BotCommandScopeChat(chat_id=user_id)
+        )
+    except Exception:
+        logger.exception("refresh_private_commands_for_user failed: user_id=%s", user_id)
+
+async def post_init(app):
+    try:
+        # 全局默认（群里）
+        await app.bot.set_my_commands(
+            commands=[
+                BotCommand("start", "打开面板"),
+                BotCommand("myid", "查看我的ID"),
+                BotCommand("whoami", "查看当前身份"),
+                BotCommand("buy", "群内兑换：/buy 商品ID"),
+                BotCommand("cancel", "取消当前输入"),
+            ],
+            scope=BotCommandScopeDefault()
+        )
+
+        # 全私聊默认（普通用户）
+        await app.bot.set_my_commands(
+            commands=[
+                BotCommand("start", "打开面板并选择管理群"),
+                BotCommand("myid", "查看我的ID"),
+                BotCommand("whoami", "查看当前身份"),
+                BotCommand("cancel", "取消当前输入"),
+            ],
+            scope=BotCommandScopeAllPrivateChats()
+        )
+
+        # 启动时给已知管理员覆盖专属命令
+        seen = set()
+        with pg_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT user_id FROM chat_admins")
+                for (uid,) in cur.fetchall():
+                    uid = int(uid)
+                    if uid not in seen:
+                        seen.add(uid)
+                        await refresh_private_commands_for_user(app, uid)
+
+    except Exception:
+        logger.exception("set_my_commands failed")
+
+async def notify_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buyer_id: int, item_id: int):
+    """
+    兑换通知：群内简讯 + 管理员私聊
+    """
     try:
         it = get_item(chat_id, item_id)
         if not it:
@@ -739,6 +831,21 @@ async def notify_admins_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         _id, title, price, stock, enabled = it
         bal = wallet_get(chat_id, buyer_id)
 
+        # 群内通知
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🧾 兑换成功通知\n"
+                    f"用户：{buyer_id}\n"
+                    f"商品：{title}\n"
+                    f"花费：{milli_to_coin(price)} 金币"
+                )
+            )
+        except Exception:
+            logger.exception("notify group failed: chat_id=%s", chat_id)
+
+        # 管理员私聊通知
         admin_ids = list_chat_admin_ids(chat_id)
         if not admin_ids:
             return
@@ -752,14 +859,13 @@ async def notify_admins_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: in
             f"用户余额：{milli_to_coin(bal)} 金币\n"
             f"库存剩余：{'∞' if stock is None else stock}"
         )
-
         for aid in admin_ids:
             try:
                 await context.bot.send_message(chat_id=aid, text=text)
             except Exception:
                 logger.exception("notify admin failed: admin_id=%s", aid)
     except Exception:
-        logger.exception("notify_admins_purchase failed")
+        logger.exception("notify_purchase failed")
 
 # =========================
 # Commands
@@ -771,10 +877,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("sel_chat_id", None)
     context.user_data.pop("sel_chat_title", None)
     clear_pending_state(context)
+
+    if update.effective_user:
+        await refresh_private_commands_for_user(context.application, update.effective_user.id)
+
     await update.message.reply_text(
         "📋 管理面板\n请先选择你要管理的群组：",
         reply_markup=kb_home()
     )
+
 
 async def safe_edit(q, text, reply_markup=None):
     try:
@@ -877,16 +988,13 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("已取消当前输入流程。")
 
 async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
-        return
-    uid = update.effective_user.id
-    ok, cid_or_msg = ensure_admin_selected_chat(uid, context)
-    if not ok:
-        await update.message.reply_text(
-            f"{cid_or_msg}\n\n请先在私聊执行：/start -> 选择管理群组，再使用 /additem"
-        )
+    if not update.message:
         return
 
+    ok, cid_or_msg = can_use_admin_command(update, context)
+    if not ok:
+        await update.message.reply_text(cid_or_msg)
+        return
     chat_id = cid_or_msg
 
     raw = update.message.text.replace("/additem", "", 1).strip()
@@ -956,8 +1064,8 @@ async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed = is_root_admin(operator) or is_chat_admin(chat_id, operator)
     if not allowed:
         await update.message.reply_text(
-            "无权限：仅根管理员或本群管理员可授权\n"
-            "可先 /whoami 检查身份，或让 root 先授权你。"
+            "无权限：仅本群已绑定管理员可授权。\n"
+            "普通用户不可使用此命令。"
         )
         return
 
@@ -972,6 +1080,8 @@ async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_chat_admin(chat_id, target, "admin")
     await update.message.reply_text(f"已授权 {target} 为本群管理员")
 
+    await refresh_private_commands_for_user(context.application, target)
+
 async def unbind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
         return
@@ -983,7 +1093,7 @@ async def unbind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     operator = update.effective_user.id
     allowed = is_root_admin(operator) or is_chat_admin(chat_id, operator)
     if not allowed:
-        await update.message.reply_text("无权限：仅根管理员或本群管理员可移除")
+        await update.message.reply_text("无权限：仅本群已绑定管理员可移除。普通用户不可使用此命令。")
         return
 
     if not context.args:
@@ -996,6 +1106,10 @@ async def unbind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, msg = del_chat_admin(chat_id, target)
     await update.message.reply_text(msg)
+
+    if ok:
+        await refresh_private_commands_for_user(context.application, target)
+
 
 # =========================
 # Callback
@@ -1674,7 +1788,7 @@ def main():
     migrate_rule_names_to_cn()
     logger.info("ROOT_ADMIN_IDS loaded: %s", sorted(list(ROOT_ADMIN_IDS)))
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid_cmd))
