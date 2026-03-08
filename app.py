@@ -270,6 +270,17 @@ def list_chat_admins(conn, chat_id: int):
         ORDER BY created_at ASC
         """, (chat_id,))
         return cur.fetchall()
+            
+@with_conn
+def list_chat_admin_ids(conn, chat_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT user_id
+        FROM chat_admins
+        WHERE chat_id=%s
+        ORDER BY created_at ASC
+        """, (chat_id,))
+        return [int(r[0]) for r in cur.fetchall()]
 
 # =========================
 # Business DB
@@ -484,6 +495,12 @@ def buy_item_atomic(conn, chat_id: int, user_id: int, item_id: int):
         INSERT INTO redeem_orders(chat_id,user_id,item_id,price_milli,status)
         VALUES(%s,%s,%s,%s,'approved')
         """, (chat_id, user_id, item_id, price))
+
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason)
+        VALUES(%s,%s,%s,%s,%s)
+        """, (chat_id, user_id, user_id, -int(price), f"buy_item:{item_id}:{title}"))
+
         return True, f"购买成功：{title}，扣除 {milli_to_coin(price)} 金币"
 
 # =========================
@@ -714,6 +731,36 @@ def user_panel_text(chat_id: int, user_id: int):
         "可进行兑换、查看金币记录。"
     )
 
+async def notify_admins_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buyer_id: int, item_id: int):
+    try:
+        it = get_item(chat_id, item_id)
+        if not it:
+            return
+        _id, title, price, stock, enabled = it
+        bal = wallet_get(chat_id, buyer_id)
+
+        admin_ids = list_chat_admin_ids(chat_id)
+        if not admin_ids:
+            return
+
+        text = (
+            "🛒 用户兑换通知\n"
+            f"群ID：{chat_id}\n"
+            f"用户ID：{buyer_id}\n"
+            f"商品：ID{item_id} {title}\n"
+            f"价格：{milli_to_coin(price)} 金币\n"
+            f"用户余额：{milli_to_coin(bal)} 金币\n"
+            f"库存剩余：{'∞' if stock is None else stock}"
+        )
+
+        for aid in admin_ids:
+            try:
+                await context.bot.send_message(chat_id=aid, text=text)
+            except Exception:
+                logger.exception("notify admin failed: admin_id=%s", aid)
+    except Exception:
+        logger.exception("notify_admins_purchase failed")
+
 # =========================
 # Commands
 # =========================
@@ -883,8 +930,15 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if item_id <= 0:
         await update.message.reply_text("商品ID错误")
         return
+
     ok, msg = buy_item_atomic(chat_id, update.effective_user.id, item_id)
     await update.message.reply_text(msg)
+
+    if ok:
+        try:
+            await notify_admins_purchase(context, chat_id, update.effective_user.id, item_id)
+        except Exception:
+            logger.exception("notify purchase failed in /buy")
 
 async def bind_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat or not update.effective_user:
@@ -1046,6 +1100,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = clamp(page, 0, max_page)
             items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
 
+            buy_rows = []
             if not items:
                 txt = "🎁 商城（当前群）\n暂无可兑换商品"
             else:
@@ -1054,16 +1109,25 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not enabled:
                         continue
                     lines.append(f"ID{item_id}｜{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
+                    buy_rows.append([
+                        InlineKeyboardButton(
+                            f"🛒 购买 ID{item_id} {title[:8]}",
+                            callback_data=f"v3:u:buy:{item_id}:{page}"
+                        )
+                    ])
                 txt = "\n".join(lines)
 
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️", callback_data=f"v3:u:shop:{max(0, page - 1)}"),
-                 InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
-                 InlineKeyboardButton("➡️", callback_data=f"v3:u:shop:{min(max_page, page + 1)}")],
-                [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
-            ])
+            kb = InlineKeyboardMarkup(
+                buy_rows + [
+                    [InlineKeyboardButton("⬅️", callback_data=f"v3:u:shop:{max(0, page - 1)}"),
+                     InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+                     InlineKeyboardButton("➡️", callback_data=f"v3:u:shop:{min(max_page, page + 1)}")],
+                    [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
+                ]
+            )
             await safe_edit(q, txt, reply_markup=kb)
             return
+
 
         if data.startswith("v3:u:logs:"):
             await q.answer()
@@ -1093,6 +1157,55 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
             ])
             await safe_edit(q, txt[:3900], reply_markup=kb)
+            return
+
+        if data.startswith("v3:u:buy:"):
+            await q.answer()
+            chat_id = q.message.chat_id
+            parts = data.split(":")
+            item_id = safe_int(parts[3], 0)
+            page = safe_int(parts[4], 0) if len(parts) > 4 else 0
+
+            ok_buy, msg = buy_item_atomic(chat_id, uid, item_id)
+            await q.answer(msg[:180], show_alert=True)
+
+            if ok_buy:
+                try:
+                    await notify_admins_purchase(context, chat_id, uid, item_id)
+                except Exception:
+                    logger.exception("notify purchase failed")
+
+            total = shop_count(chat_id)
+            max_page = max(0, (total - 1) // SHOP_SIZE) if total > 0 else 0
+            page = clamp(page, 0, max_page)
+            items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
+
+            buy_rows = []
+            if not items:
+                txt = "🎁 商城（当前群）\n暂无可兑换商品"
+            else:
+                lines = ["🎁 商城（当前群）"]
+                for iid, title, price, stock, enabled in items:
+                    if not enabled:
+                        continue
+                    lines.append(f"ID{iid}｜{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
+                    buy_rows.append([
+                        InlineKeyboardButton(
+                            f"🛒 购买 ID{iid} {title[:8]}",
+                            callback_data=f"v3:u:buy:{iid}:{page}"
+                        )
+                    ])
+                txt = "\n".join(lines)
+
+            kb = InlineKeyboardMarkup(
+                buy_rows + [
+                    [InlineKeyboardButton("⬅️", callback_data=f"v3:u:shop:{max(0, page - 1)}"),
+                     InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
+                     InlineKeyboardButton("➡️", callback_data=f"v3:u:shop:{min(max_page, page + 1)}")],
+                    [InlineKeyboardButton("🔙 返回用户面板", callback_data="v3:u:refresh")]
+                ]
+            )
+            await safe_edit(q, txt, reply_markup=kb)
             return
 
         # ===== 管理员区 =====
