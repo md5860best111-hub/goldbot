@@ -557,6 +557,7 @@ def clear_pending_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("await_target_input", None)
     context.user_data.pop("await_rule_name", None)
     context.user_data.pop("await_item_title", None)
+    context.user_data.pop("await_add_item_input", None)
 
 def console_text(context: ContextTypes.DEFAULT_TYPE, uid: int):
     cid = selected_chat_id(context)
@@ -681,7 +682,7 @@ def kb_adm_shop(chat_id: int, page: int):
         InlineKeyboardButton(f"第{page + 1}/{max_page + 1}页", callback_data="v3:noop"),
         InlineKeyboardButton("➡️", callback_data=f"v3:adm_shop:{min(max_page, page + 1)}")
     ])
-    rows.append([InlineKeyboardButton("➕新增商品（/additem 标题|价格|库存）", callback_data="v3:noop")])
+    rows.append([InlineKeyboardButton("➕ 新增商品", callback_data="v3:adm_additem_start")])
     rows.append([InlineKeyboardButton("🔙 返回控制台", callback_data="v3:admin_home")])
     return InlineKeyboardMarkup(rows)
 
@@ -1249,6 +1250,19 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q, "🎁 商品管理（仅当前群）", reply_markup=kb_adm_shop(chat_id, page))
             return
 
+                if data == "v3:adm_additem_start":
+            await q.answer()
+            context.user_data["await_add_item_input"] = True
+            await safe_edit(
+                q,
+                "🧩 请输入新商品信息：\n"
+                "格式：标题 | 价格 | 库存(可选)\n"
+                "例如：周边徽章 | 9.9 | 20\n"
+                "不填库存则为∞\n"
+                "发送 /cancel 可取消"
+            )
+            return
+
         if data.startswith("v3:adm_item:"):
             await q.answer()
             item_id = safe_int(data.split(":")[2], 0)
@@ -1406,6 +1420,48 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"规则 ID{rid} 名称已更新为：{name}")
             return
 
+            if context.user_data.get("await_add_item_input"):
+            ok, v = ensure_admin_selected_chat(user_id, context)
+            if not ok:
+                await update.message.reply_text(v)
+                return
+
+            raw = text.strip()
+            parts = [x.strip() for x in raw.split("|")]
+            if len(parts) < 2:
+                await update.message.reply_text("格式错误，请用：标题 | 价格 | 库存(可选)\n例如：周边徽章 | 9.9 | 20")
+                return
+
+            title = parts[0][:40].strip()
+            if not title:
+                await update.message.reply_text("标题不能为空")
+                return
+
+            try:
+                price = coin_to_milli(parts[1])
+                if price <= 0:
+                    await update.message.reply_text("价格必须大于0")
+                    return
+            except Exception:
+                await update.message.reply_text("价格格式错误")
+                return
+
+            stock = None
+            if len(parts) >= 3 and parts[2]:
+                try:
+                    stock = int(parts[2])
+                    if stock < 0:
+                        await update.message.reply_text("库存不能小于0")
+                        return
+                except Exception:
+                    await update.message.reply_text("库存必须是整数")
+                    return
+
+            add_item(v, title, price, stock)
+            context.user_data["await_add_item_input"] = False
+            await update.message.reply_text(f"✅ 已添加商品：{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
+            return
+
         if context.user_data.get("await_item_title"):
             ok, v = ensure_admin_selected_chat(user_id, context)
             if not ok:
@@ -1455,11 +1511,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rules = list_rules(chat_id, 100, 0)
         total = 0
+        hits = []  # [(name, amt)]
         for rid, name, p, mn, mx, en, pr in rules:
             if not en:
                 continue
             if random.random() < float(p):
-                total += random.randint(int(mn), int(mx))
+                amt = random.randint(int(mn), int(mx))
+                total += amt
+                hits.append((name, amt))
         if total <= 0:
             return
 
@@ -1471,7 +1530,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         wallet_add(chat_id, user_id, grant)
         add_daily(chat_id, user_id, grant)
-        await update.message.reply_text(f"🎉 {user.first_name} 获得 {milli_to_coin(grant)} 金币")
+
+        if hits:
+            top_name, top_amt = max(hits, key=lambda x: x[1])
+        else:
+            top_name, top_amt = ("神秘红包", grant)
+
+        flair = "🎉"
+        if "锦鲤" in top_name:
+            flair = "🐉✨"
+        elif "惊喜" in top_name:
+            flair = "🎊💥"
+        elif "普通" in top_name:
+            flair = "🧧"
+
+        detail = " + ".join([f"{n}:{milli_to_coin(a)}" for n, a in hits[:3]])
+        if len(hits) > 3:
+            detail += " + ..."
+
+        await update.message.reply_text(
+            f"{flair} 恭喜 {user.first_name} 中奖！\n"
+            f"🏆 命中档次：{top_name}\n"
+            f"💰 本次获得：{milli_to_coin(grant)} 金币\n"
+            f"📦 命中明细：{detail if detail else '-'}"
+        )
 
 # =========================
 # Main
