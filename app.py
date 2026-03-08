@@ -1160,7 +1160,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("v3:u:buy:"):
-            await q.answer()
             chat_id = q.message.chat_id
             parts = data.split(":")
             item_id = safe_int(parts[3], 0)
@@ -1181,20 +1180,21 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
 
             buy_rows = []
-            if not items:
+            lines = ["🎁 商城（当前群）"]
+            for iid, title, price, stock, enabled in items:
+                if not enabled:
+                    continue
+                lines.append(f"ID{iid}｜{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
+                buy_rows.append([
+                    InlineKeyboardButton(
+                        f"🛒 购买 ID{iid} {title[:8]}",
+                        callback_data=f"v3:u:buy:{iid}:{page}"
+                    )
+                ])
+
+            if len(lines) == 1:
                 txt = "🎁 商城（当前群）\n暂无可兑换商品"
             else:
-                lines = ["🎁 商城（当前群）"]
-                for iid, title, price, stock, enabled in items:
-                    if not enabled:
-                        continue
-                    lines.append(f"ID{iid}｜{title}｜{milli_to_coin(price)}｜库存{'∞' if stock is None else stock}")
-                    buy_rows.append([
-                        InlineKeyboardButton(
-                            f"🛒 购买 ID{iid} {title[:8]}",
-                            callback_data=f"v3:u:buy:{iid}:{page}"
-                        )
-                    ])
                 txt = "\n".join(lines)
 
             kb = InlineKeyboardMarkup(
