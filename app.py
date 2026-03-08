@@ -2,6 +2,7 @@ import os
 import re
 import random
 import logging
+import asyncio
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlparse
 from functools import wraps
@@ -765,20 +766,32 @@ async def _job_delete_msg(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("delete message failed: chat_id=%s message_id=%s", chat_id, message_id)
 
+async def _del_after(app, chat_id: int, message_id: int, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        await app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        logger.exception("delete message fallback failed: chat_id=%s message_id=%s", chat_id, message_id)
+
 async def auto_delete_pair(context: ContextTypes.DEFAULT_TYPE, chat_id: int, trigger_mid: int, bot_mid: int, delay: int = 60):
     try:
-        context.application.job_queue.run_once(
-            _job_delete_msg,
-            when=delay,
-            data={"chat_id": chat_id, "message_id": trigger_mid},
-            name=f"del_trigger_{chat_id}_{trigger_mid}"
-        )
-        context.application.job_queue.run_once(
-            _job_delete_msg,
-            when=delay,
-            data={"chat_id": chat_id, "message_id": bot_mid},
-            name=f"del_bot_{chat_id}_{bot_mid}"
-        )
+        jq = context.application.job_queue
+        if jq is not None:
+            jq.run_once(
+                _job_delete_msg,
+                when=delay,
+                data={"chat_id": chat_id, "message_id": trigger_mid},
+                name=f"del_trigger_{chat_id}_{trigger_mid}"
+            )
+            jq.run_once(
+                _job_delete_msg,
+                when=delay,
+                data={"chat_id": chat_id, "message_id": bot_mid},
+                name=f"del_bot_{chat_id}_{bot_mid}"
+            )
+        else:
+            asyncio.create_task(_del_after(context.application, chat_id, trigger_mid, delay))
+            asyncio.create_task(_del_after(context.application, chat_id, bot_mid, delay))
     except Exception:
         logger.exception("schedule auto delete pair failed")
 
@@ -821,8 +834,11 @@ async def additem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ok, cid_or_msg = ensure_admin_selected_chat(uid, context)
     if not ok:
-        await update.message.reply_text(cid_or_msg)
+        await update.message.reply_text(
+            f"{cid_or_msg}\n\n请先在私聊执行：/start -> 选择管理群组，再使用 /additem"
+        )
         return
+
     chat_id = cid_or_msg
 
     raw = update.message.text.replace("/additem", "", 1).strip()
