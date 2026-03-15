@@ -98,6 +98,19 @@ def valid_text_basic(text: str, min_len: int) -> bool:
 def is_root_admin(user_id: int) -> bool:
     return user_id in ROOT_ADMIN_IDS
 
+def fmt_display_name(first: str, last: str, username: str, uid: int) -> str:
+    """格式化显示名称，优先用真实姓名"""
+    name = ""
+    if first:
+        name = first
+        if last:
+            name += f" {last}"
+    elif username:
+        name = f"@{username}"
+    else:
+        name = str(uid)
+    return name
+
 # =========================
 # DB / Redis
 # =========================
@@ -155,6 +168,7 @@ def init_db(conn):
           chat_id BIGINT NOT NULL,
           user_id BIGINT NOT NULL,
           balance_milli BIGINT NOT NULL DEFAULT 0,
+          display_name TEXT NOT NULL DEFAULT '',
           updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
           PRIMARY KEY (chat_id, user_id)
         );
@@ -208,12 +222,13 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS chat_settings (
           chat_id BIGINT PRIMARY KEY,
           rank_keywords TEXT NOT NULL DEFAULT '排行榜,排名,积分榜',
+          shop_keywords TEXT NOT NULL DEFAULT '商城,兑换,商店',
           redeem_notice TEXT NOT NULL DEFAULT '',
           rank_delete_seconds INT NOT NULL DEFAULT 120,
           updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
-        # 先补列，再建依赖列的索引
+        # 补列
         cur.execute("""
         DO $$ BEGIN
           IF NOT EXISTS (
@@ -241,6 +256,28 @@ def init_db(conn):
             WHERE table_name='chat_settings' AND column_name='rank_delete_seconds'
           ) THEN
             ALTER TABLE chat_settings ADD COLUMN rank_delete_seconds INT NOT NULL DEFAULT 120;
+          END IF;
+        END $$;
+        """)
+        # [FIX1] 新增 shop_keywords 列
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='chat_settings' AND column_name='shop_keywords'
+          ) THEN
+            ALTER TABLE chat_settings ADD COLUMN shop_keywords TEXT NOT NULL DEFAULT '商城,兑换,商店';
+          END IF;
+        END $$;
+        """)
+        # [FIX2] 新增 display_name 列
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='wallets' AND column_name='display_name'
+          ) THEN
+            ALTER TABLE wallets ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
           END IF;
         END $$;
         """)
@@ -288,6 +325,26 @@ def migrate_db(conn):
             WHERE table_name='chat_settings' AND column_name='rank_delete_seconds'
           ) THEN
             ALTER TABLE chat_settings ADD COLUMN rank_delete_seconds INT NOT NULL DEFAULT 120;
+          END IF;
+        END $$;
+        """)
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='chat_settings' AND column_name='shop_keywords'
+          ) THEN
+            ALTER TABLE chat_settings ADD COLUMN shop_keywords TEXT NOT NULL DEFAULT '商城,兑换,商店';
+          END IF;
+        END $$;
+        """)
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='wallets' AND column_name='display_name'
+          ) THEN
+            ALTER TABLE wallets ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
           END IF;
         END $$;
         """)
@@ -366,7 +423,7 @@ def list_chat_admin_ids(conn, chat_id: int):
 def get_chat_settings(conn, chat_id: int) -> dict:
     with conn.cursor() as cur:
         cur.execute("""
-        SELECT rank_keywords, redeem_notice, rank_delete_seconds
+        SELECT rank_keywords, redeem_notice, rank_delete_seconds, shop_keywords
         FROM chat_settings WHERE chat_id=%s
         """, (chat_id,))
         row = cur.fetchone()
@@ -375,8 +432,14 @@ def get_chat_settings(conn, chat_id: int) -> dict:
                 "rank_keywords": row[0],
                 "redeem_notice": row[1],
                 "rank_delete_seconds": int(row[2]) if row[2] else 120,
+                "shop_keywords": row[3] if row[3] else "商城,兑换,商店",
             }
-        return {"rank_keywords": "排行榜,排名,积分榜", "redeem_notice": "", "rank_delete_seconds": 120}
+        return {
+            "rank_keywords": "排行榜,排名,积分榜",
+            "redeem_notice": "",
+            "rank_delete_seconds": 120,
+            "shop_keywords": "商城,兑换,商店",
+        }
 
 @with_conn
 def set_chat_setting(conn, chat_id: int, key: str, value):
@@ -386,6 +449,12 @@ def set_chat_setting(conn, chat_id: int, key: str, value):
             INSERT INTO chat_settings(chat_id,rank_keywords,updated_at)
             VALUES(%s,%s,NOW())
             ON CONFLICT(chat_id) DO UPDATE SET rank_keywords=EXCLUDED.rank_keywords,updated_at=NOW()
+            """, (chat_id, value))
+        elif key == "shop_keywords":
+            cur.execute("""
+            INSERT INTO chat_settings(chat_id,shop_keywords,updated_at)
+            VALUES(%s,%s,NOW())
+            ON CONFLICT(chat_id) DO UPDATE SET shop_keywords=EXCLUDED.shop_keywords,updated_at=NOW()
             """, (chat_id, value))
         elif key == "redeem_notice":
             cur.execute("""
@@ -460,16 +529,19 @@ def wallet_get(conn, chat_id: int, user_id: int) -> int:
         return int(r[0]) if r else 0
 
 @with_conn
-def wallet_add(conn, chat_id: int, user_id: int, delta: int, reason: str = "drop"):
+def wallet_add(conn, chat_id: int, user_id: int, delta: int, reason: str = "drop", display_name: str = ""):
     with conn.cursor() as cur:
         if delta < 0:
             raise ValueError("wallet_add delta 必须 >= 0")
         cur.execute("""
-        INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
-        VALUES(%s,%s,%s,NOW())
+        INSERT INTO wallets(chat_id,user_id,balance_milli,display_name,updated_at)
+        VALUES(%s,%s,%s,%s,NOW())
         ON CONFLICT(chat_id,user_id)
-        DO UPDATE SET balance_milli=wallets.balance_milli+EXCLUDED.balance_milli,updated_at=NOW()
-        """, (chat_id, user_id, delta))
+        DO UPDATE SET
+          balance_milli=wallets.balance_milli+EXCLUDED.balance_milli,
+          display_name=CASE WHEN EXCLUDED.display_name!='' THEN EXCLUDED.display_name ELSE wallets.display_name END,
+          updated_at=NOW()
+        """, (chat_id, user_id, delta, display_name or ""))
         cur.execute("""
         INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
         VALUES(%s,0,%s,%s,%s,'drop')
@@ -501,7 +573,7 @@ def wallet_adjust_admin(conn, chat_id: int, operator_id: int, user_id: int, delt
 def get_all_wallets(conn, chat_id: int, limit=15, offset=0):
     with conn.cursor() as cur:
         cur.execute("""
-        SELECT user_id,balance_milli,updated_at FROM wallets WHERE chat_id=%s
+        SELECT user_id,balance_milli,updated_at,display_name FROM wallets WHERE chat_id=%s
         ORDER BY balance_milli DESC LIMIT %s OFFSET %s
         """, (chat_id, limit, offset))
         return cur.fetchall()
@@ -575,6 +647,17 @@ def shop_count(conn, chat_id: int) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM shop_items WHERE chat_id=%s", (chat_id,))
         return int(cur.fetchone()[0])
+
+@with_conn
+def shop_count_enabled(conn, chat_id: int) -> int:
+    """只统计上架中的商品数量"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM shop_items WHERE chat_id=%s AND enabled=TRUE",
+            (chat_id,)
+        )
+        return int(cur.fetchone()[0])
+
 
 @with_conn
 def get_item(conn, chat_id: int, item_id: int):
@@ -702,7 +785,8 @@ def get_chat_stats(conn, chat_id: int) -> dict:
 def get_wallet_rank(conn, chat_id: int, limit=15, offset=0):
     with conn.cursor() as cur:
         cur.execute("""
-        SELECT user_id,balance_milli FROM wallets WHERE chat_id=%s AND balance_milli>0
+        SELECT user_id,balance_milli,display_name FROM wallets
+        WHERE chat_id=%s AND balance_milli>0
         ORDER BY balance_milli DESC LIMIT %s OFFSET %s
         """, (chat_id, limit, offset))
         return cur.fetchall()
@@ -792,8 +876,9 @@ def clear_pending_state(context: ContextTypes.DEFAULT_TYPE):
         "await_target_input", "await_rule_name", "await_item_title",
         "await_add_item_input", "await_rule_prob", "await_rule_min",
         "await_rule_max", "await_item_price", "await_item_stock",
-        "await_item_desc", "await_rank_keywords", "await_redeem_notice",
-        "await_adm_add", "await_adm_sub", "await_rank_delete_seconds",
+        "await_item_desc", "await_rank_keywords", "await_shop_keywords",
+        "await_redeem_notice", "await_adm_add", "await_adm_sub",
+        "await_rank_delete_seconds",
     ]:
         context.user_data.pop(k, None)
 
@@ -842,6 +927,7 @@ def stats_text(chat_id: int) -> str:
         f"  📦 兑换笔数：{s['month_orders']} 笔\n"
     )
 
+# [FIX2] 排名显示姓名+可点击链接
 def rank_text(chat_id: int, page: int) -> tuple:
     total = get_wallet_rank_count(chat_id)
     max_page = max(0, (total - 1) // RANK_SIZE) if total > 0 else 0
@@ -849,10 +935,13 @@ def rank_text(chat_id: int, page: int) -> tuple:
     rows = get_wallet_rank(chat_id, RANK_SIZE, page * RANK_SIZE)
     medals = ["🥇", "🥈", "🥉"]
     lines = [f"🏆 金币排行榜（第 {page+1}/{max_page+1} 页）\n"]
-    for i, (uid, bal) in enumerate(rows):
+    for i, (uid, bal, display_name) in enumerate(rows):
         rank_num = page * RANK_SIZE + i + 1
         medal = medals[rank_num - 1] if rank_num <= 3 else f"#{rank_num}"
-        lines.append(f"{medal} <a href=\"tg://user?id={uid}\">{uid}</a> — {milli_to_coin(bal)} 金币")
+        name = display_name if display_name else str(uid)
+        lines.append(
+            f"{medal} <a href=\"tg://user?id={uid}\">{name}</a> — {milli_to_coin(bal)} 金币"
+        )
     txt = "\n".join(lines) if rows else "🏆 暂无排行数据"
     return txt, max_page
 
@@ -887,17 +976,19 @@ def rule_detail_text(r) -> str:
 def settings_text(chat_id: int) -> str:
     s = get_chat_settings(chat_id)
     kw = s.get("rank_keywords", "排行榜,排名,积分榜")
+    skw = s.get("shop_keywords", "商城,兑换,商店")
     notice = s.get("redeem_notice", "") or "（未设置）"
     rd = s.get("rank_delete_seconds", 120)
     return (
         f"⚙️ 群组设置\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔑 排行榜关键词：{kw}\n"
+        f"🛒 商城关键词：{skw}\n"
         f"⏱ 排行榜自毁时间：{rd} 秒\n"
         f"📢 兑换通知文本：{notice}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📖 说明：\n"
-        f"• 关键词：用逗号分隔，用户在群内发送即触发排行榜\n"
+        f"• 排行榜/商城关键词：逗号分隔，群内发送即触发\n"
         f"• 自毁时间：排行榜消息多少秒后自动删除（0=不删除）\n"
         f"• 兑换通知：兑换成功后附加在通知末尾的说明"
     )
@@ -912,6 +1003,13 @@ def user_panel_text(chat_id: int, user_id: int) -> str:
         f"━━━━━━━━━━━━━━━━━━\n"
         f"点击下方按钮兑换商品或查看记录"
     )
+
+# =========================
+# [FIX3] 统一取消按钮 helper
+# =========================
+def kb_cancel(back_data: str = "v4:admin_home"):
+    """统一的取消按钮行"""
+    return [InlineKeyboardButton("❌ 取消", callback_data=f"v4:cancel_input:{back_data}")]
 
 # =========================
 # Keyboards
@@ -942,13 +1040,13 @@ def kb_groups(user_id: int, page: int):
 def kb_console():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💰 金币管理", callback_data="v4:adm_user"),
-        InlineKeyboardButton("⚙️ 抽奖规则", callback_data="v4:adm_rules:0")],
+         InlineKeyboardButton("⚙️ 抽奖规则", callback_data="v4:adm_rules:0")],
         [InlineKeyboardButton("🎁 商品管理", callback_data="v4:adm_shop:0"),
-        InlineKeyboardButton("🧾 操作日志", callback_data="v4:logs:0:all")],
+         InlineKeyboardButton("🧾 操作日志", callback_data="v4:logs:0:all")],
         [InlineKeyboardButton("📊 数据统计", callback_data="v4:stats"),
-        InlineKeyboardButton("🏆 排行榜", callback_data="v4:rank:0")],
+         InlineKeyboardButton("🏆 排行榜", callback_data="v4:rank:0")],
         [InlineKeyboardButton("💼 用户余额", callback_data="v4:wallets:0"),
-        InlineKeyboardButton("⚙️ 群组设置", callback_data="v4:chat_settings")],
+         InlineKeyboardButton("⚙️ 群组设置", callback_data="v4:chat_settings")],
         [InlineKeyboardButton("🔁 切换群组", callback_data="v4:groups:0")],
     ])
 
@@ -956,7 +1054,7 @@ def kb_adm_user():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎯 选择目标用户", callback_data="v4:adm_target")],
         [InlineKeyboardButton("➕ 增加金币", callback_data="v4:adm_add_input"),
-        InlineKeyboardButton("➖ 扣除金币", callback_data="v4:adm_sub_input")],
+         InlineKeyboardButton("➖ 扣除金币", callback_data="v4:adm_sub_input")],
         [InlineKeyboardButton("🔍 查询余额", callback_data="v4:adm_qbal")],
         [InlineKeyboardButton("🔙 返回控制台", callback_data="v4:admin_home")],
     ])
@@ -980,10 +1078,10 @@ def kb_adm_rules(chat_id: int, page: int):
 def kb_rule_edit(rid: int):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ 修改名称", callback_data=f"v4:r:name:{rid}"),
-        InlineKeyboardButton("🔁 开启/关闭", callback_data=f"v4:r:toggle:{rid}")],
+         InlineKeyboardButton("🔁 开启/关闭", callback_data=f"v4:r:toggle:{rid}")],
         [InlineKeyboardButton("📊 修改概率", callback_data=f"v4:r:prob_input:{rid}")],
         [InlineKeyboardButton("📉 修改最小金额", callback_data=f"v4:r:min_input:{rid}"),
-        InlineKeyboardButton("📈 修改最大金额", callback_data=f"v4:r:max_input:{rid}")],
+         InlineKeyboardButton("📈 修改最大金额", callback_data=f"v4:r:max_input:{rid}")],
         [InlineKeyboardButton("🔙 返回规则列表", callback_data="v4:adm_rules:0")],
     ])
 
@@ -996,10 +1094,10 @@ def kb_logs(chat_id: int, page: int, log_type: str = "all"):
         return InlineKeyboardButton(f"{marker}{label}", callback_data=f"v4:logs:0:{lt}")
     return InlineKeyboardMarkup([
         [_btn("全部", "all"), _btn("发放", "drop"),
-        _btn("兑换", "redeem"), _btn("管理", "admin")],
+         _btn("兑换", "redeem"), _btn("管理", "admin")],
         [InlineKeyboardButton("⬅️", callback_data=f"v4:logs:{max(0,page-1)}:{log_type}"),
-        InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v4:logs:{min(max_page,page+1)}:{log_type}")],
+         InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
+         InlineKeyboardButton("➡️", callback_data=f"v4:logs:{min(max_page,page+1)}:{log_type}")],
         [InlineKeyboardButton("🔙 返回控制台", callback_data="v4:admin_home")],
     ])
 
@@ -1027,9 +1125,9 @@ def kb_item_edit(item_id: int):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 上架/下架", callback_data=f"v4:i:toggle:{item_id}")],
         [InlineKeyboardButton("✏️ 修改名称", callback_data=f"v4:i:title:{item_id}"),
-        InlineKeyboardButton("📋 修改描述", callback_data=f"v4:i:desc:{item_id}")],
+         InlineKeyboardButton("📋 修改描述", callback_data=f"v4:i:desc:{item_id}")],
         [InlineKeyboardButton("💰 修改价格", callback_data=f"v4:i:price_input:{item_id}"),
-        InlineKeyboardButton("📦 修改库存", callback_data=f"v4:i:stock_input:{item_id}")],
+         InlineKeyboardButton("📦 修改库存", callback_data=f"v4:i:stock_input:{item_id}")],
         [InlineKeyboardButton("♾️ 库存设为无限", callback_data=f"v4:i:stockinf:{item_id}")],
         [InlineKeyboardButton("🔙 返回商品列表", callback_data="v4:adm_shop:0")],
     ])
@@ -1037,12 +1135,12 @@ def kb_item_edit(item_id: int):
 def kb_user_panel():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛒 兑换商品", callback_data="v4:u:shop:0"),
-        InlineKeyboardButton("📋 金币记录", callback_data="v4:u:logs:0")],
+         InlineKeyboardButton("📋 金币记录", callback_data="v4:u:logs:0")],
         [InlineKeyboardButton("🔄 刷新余额", callback_data="v4:u:refresh")],
     ])
 
 def kb_user_shop(chat_id: int, page: int):
-    total = shop_count(chat_id)
+    total = shop_count_enabled(chat_id)
     max_page = max(0, (total - 1) // SHOP_SIZE) if total > 0 else 0
     page = clamp(page, 0, max_page)
     items = shop_page(chat_id, SHOP_SIZE, page * SHOP_SIZE)
@@ -1069,14 +1167,15 @@ def kb_wallets(chat_id: int, page: int):
     page = clamp(page, 0, max_page)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️", callback_data=f"v4:wallets:{max(0,page-1)}"),
-        InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v4:wallets:{min(max_page,page+1)}")],
+         InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
+         InlineKeyboardButton("➡️", callback_data=f"v4:wallets:{min(max_page,page+1)}")],
         [InlineKeyboardButton("🔙 返回控制台", callback_data="v4:admin_home")],
     ])
 
 def kb_chat_settings():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔑 修改排行榜关键词", callback_data="v4:set_rank_kw")],
+        [InlineKeyboardButton("🛒 修改商城关键词", callback_data="v4:set_shop_kw")],
         [InlineKeyboardButton("⏱ 修改排行榜自毁时间", callback_data="v4:set_rank_del")],
         [InlineKeyboardButton("📢 修改兑换通知文本", callback_data="v4:set_redeem_notice")],
         [InlineKeyboardButton("🔙 返回控制台", callback_data="v4:admin_home")],
@@ -1216,7 +1315,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_home()
         )
         return
-    # 若已选群则直接进控制台
     cid = selected_chat_id(context)
     if cid and is_chat_admin(cid, uid):
         await update.message.reply_text(console_text(context, uid), reply_markup=kb_console())
@@ -1326,6 +1424,28 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
 
+    # [FIX3] 统一取消输入处理
+    if data.startswith("v4:cancel_input:"):
+        await q.answer()
+        clear_pending_state(context)
+        back = data[len("v4:cancel_input:"):]
+        ok, chat_id = ensure_admin_selected_chat(uid, context)
+        if back == "v4:admin_home" or not ok:
+            await safe_edit(q, console_text(context, uid), reply_markup=kb_console())
+        elif back.startswith("v4:adm_rules"):
+            await safe_edit(q, "⚙️ 抽奖规则管理\n点击规则可编辑",
+                reply_markup=kb_adm_rules(chat_id, 0))
+        elif back.startswith("v4:adm_shop"):
+            await safe_edit(q, "🎁 商品管理", reply_markup=kb_adm_shop(chat_id, 0))
+        elif back == "v4:chat_settings":
+            await safe_edit(q, settings_text(chat_id), reply_markup=kb_chat_settings())
+        elif back == "v4:adm_user":
+            t = context.user_data.get("adm_target", uid)
+            await safe_edit(q, adm_user_text(chat_id, t), reply_markup=kb_adm_user())
+        else:
+            await safe_edit(q, console_text(context, uid), reply_markup=kb_console())
+        return
+
     # ── 首页 ──
     if data == "v4:home":
         await q.answer()
@@ -1343,7 +1463,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = safe_int(data.split(":")[2], 0)
         chats = list_user_admin_chats(uid)
         if not chats:
-            await safe_edit(q, "⚠️ 你目前没有管理任何群组\n请让群主在群内使用 /bind_admin 授权", reply_markup=kb_home())
+            await safe_edit(q, "⚠️ 你目前没有管理任何群组\n请让群主在群内使用 /bind_admin 授权",
+                reply_markup=kb_home())
             return
         await safe_edit(q, "🗂️ 请选择要管理的群组：", reply_markup=kb_groups(uid, page))
         return
@@ -1355,7 +1476,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ 你不是该群管理员", show_alert=True)
             return
         context.user_data["sel_chat_id"] = cid
-        # 获取群名
         with pg_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT title FROM chats WHERE chat_id=%s", (cid,))
@@ -1394,8 +1514,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["await_target_input"] = True
         await safe_edit(q,
             "🎯 请输入目标用户的 Telegram ID（纯数字）\n\n"
-            "💡 提示：用户可发送 /myid 获取自己的ID\n"
-            "发送 /cancel 可取消")
+            "💡 提示：用户可发送 /myid 获取自己的ID",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_user")]))
         return
 
     if data == "v4:adm_add_input":
@@ -1410,8 +1530,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"当前余额：{milli_to_coin(bal)} 金币\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"请输入要增加的金币数量\n"
-            f"支持小数，如：10 或 0.5\n\n"
-            f"发送 /cancel 可取消")
+            f"支持小数，如：10 或 0.5",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_user")]))
         return
 
     if data == "v4:adm_sub_input":
@@ -1426,8 +1546,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"当前余额：{milli_to_coin(bal)} 金币\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"请输入要扣除的金币数量\n"
-            f"支持小数，如：10 或 0.5\n\n"
-            f"发送 /cancel 可取消")
+            f"支持小数，如：10 或 0.5",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_user")]))
         return
 
     if data == "v4:adm_qbal":
@@ -1478,7 +1598,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rid = safe_int(data.split(":")[3], 0)
         context.user_data["await_rule_name"] = rid
         await safe_edit(q,
-            f"✏️ 修改规则名称\n规则ID：{rid}\n\n请输入新名称：\n发送 /cancel 可取消")
+            f"✏️ 修改规则名称\n规则ID：{rid}\n\n请输入新名称：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_rule:{rid}")]))
         return
 
     if data.startswith("v4:r:prob_input:"):
@@ -1489,10 +1610,10 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 修改触发概率\n"
             f"规则：{r[1] if r else rid}\n"
             f"当前概率：{float(r[2])*100:.4f}%\n\n"
-            f"请输入新概率（支持格式）：\n"
+            f"请输入新概率：\n"
             f"• 输入 5 或 5% → 5%\n"
-            f"• 输入 0.5 或 0.5% → 0.5%\n\n"
-            f"发送 /cancel 可取消")
+            f"• 输入 0.5 或 0.5% → 0.5%",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_rule:{rid}")]))
         context.user_data["await_rule_prob"] = rid
         return
 
@@ -1504,8 +1625,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📉 修改最小金额\n"
             f"规则：{r[1] if r else rid}\n"
             f"当前最小：{milli_to_coin(int(r[3])) if r else '?'} 金币\n\n"
-            f"请输入新的最小金额（如：0.5 或 1）：\n"
-            f"发送 /cancel 可取消")
+            f"请输入新的最小金额（如：0.5 或 1）：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_rule:{rid}")]))
         context.user_data["await_rule_min"] = rid
         return
 
@@ -1517,8 +1638,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📈 修改最大金额\n"
             f"规则：{r[1] if r else rid}\n"
             f"当前最大：{milli_to_coin(int(r[4])) if r else '?'} 金币\n\n"
-            f"请输入新的最大金额（如：5 或 10）：\n"
-            f"发送 /cancel 可取消")
+            f"请输入新的最大金额（如：5 或 10）：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_rule:{rid}")]))
         context.user_data["await_rule_max"] = rid
         return
 
@@ -1563,8 +1684,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, txt,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️", callback_data=f"v4:rank:{max(0,page-1)}"),
-                InlineKeyboardButton(f"第{page+1}/{max_page+1}页", callback_data="v4:noop"),
-                InlineKeyboardButton("➡️", callback_data=f"v4:rank:{min(max_page,page+1)}")],
+                 InlineKeyboardButton(f"第{page+1}/{max_page+1}页", callback_data="v4:noop"),
+                 InlineKeyboardButton("➡️", callback_data=f"v4:rank:{min(max_page,page+1)}")],
                 [InlineKeyboardButton("🔙 返回控制台", callback_data="v4:admin_home")]
             ]), parse_mode="HTML")
         return
@@ -1575,10 +1696,11 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = safe_int(data.split(":")[2], 0)
         rows = get_all_wallets(chat_id, WALLET_PAGE_SIZE, page * WALLET_PAGE_SIZE)
         lines = [f"💼 用户余额列表\n"]
-        for i, (wuid, bal, upd) in enumerate(rows):
+        for i, (wuid, bal, upd, dname) in enumerate(rows):
             rank = page * WALLET_PAGE_SIZE + i + 1
+            name = dname if dname else str(wuid)
             lines.append(
-                f"#{rank} <a href=\"tg://user?id={wuid}\">{wuid}</a> — {milli_to_coin(bal)} 金币"
+                f"#{rank} <a href=\"tg://user?id={wuid}\">{name}</a> — {milli_to_coin(bal)} 金币"
             )
         txt = "\n".join(lines) if rows else "暂无数据"
         await safe_edit(q, txt, reply_markup=kb_wallets(chat_id, page), parse_mode="HTML")
@@ -1618,8 +1740,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  会员资格|10|100|有效期30天\n"
             "  无限库存商品|5|∞\n\n"
             "• 库存填 ∞ 或 0 表示无限\n"
-            "• 描述可省略\n"
-            "发送 /cancel 可取消")
+            "• 描述可省略",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_shop:0")]))
         return
 
     if data.startswith("v4:i:toggle:"):
@@ -1641,14 +1763,18 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         item_id = safe_int(data.split(":")[3], 0)
         context.user_data["await_item_title"] = item_id
-        await safe_edit(q, f"✏️ 修改商品名称\n商品ID：{item_id}\n\n请输入新名称：\n发送 /cancel 可取消")
+        await safe_edit(q,
+            f"✏️ 修改商品名称\n商品ID：{item_id}\n\n请输入新名称：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_item:{item_id}")]))
         return
 
     if data.startswith("v4:i:desc:"):
         await q.answer()
         item_id = safe_int(data.split(":")[3], 0)
         context.user_data["await_item_desc"] = item_id
-        await safe_edit(q, f"📋 修改商品描述\n商品ID：{item_id}\n\n请输入新描述（发送「清空」可删除描述）：\n发送 /cancel 可取消")
+        await safe_edit(q,
+            f"📋 修改商品描述\n商品ID：{item_id}\n\n请输入新描述（发送「清空」可删除描述）：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_item:{item_id}")]))
         return
 
     if data.startswith("v4:i:price_input:"):
@@ -1659,8 +1785,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 修改商品价格\n"
             f"商品：{it[1] if it else item_id}\n"
             f"当前价格：{milli_to_coin(it[2]) if it else '?'} 金币\n\n"
-            f"请输入新价格（如：5 或 0.5）：\n"
-            f"发送 /cancel 可取消")
+            f"请输入新价格（如：5 或 0.5）：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_item:{item_id}")]))
         context.user_data["await_item_price"] = item_id
         return
 
@@ -1672,8 +1798,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 修改商品库存\n"
             f"商品：{it[1] if it else item_id}\n"
             f"当前库存：{'∞' if it and it[3] is None else (it[3] if it else '?')}\n\n"
-            f"请输入新库存数量（整数）：\n"
-            f"发送 /cancel 可取消")
+            f"请输入新库存数量（整数）：",
+            reply_markup=InlineKeyboardMarkup([kb_cancel(f"v4:adm_item:{item_id}")]))
         context.user_data["await_item_stock"] = item_id
         return
 
@@ -1706,8 +1832,21 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔑 修改排行榜关键词\n"
             f"当前：{s.get('rank_keywords','排行榜,排名,积分榜')}\n\n"
             f"请输入新关键词（多个用逗号分隔）：\n"
-            f"例如：排行榜,排名,积分榜\n\n"
-            f"发送 /cancel 可取消")
+            f"例如：排行榜,排名,积分榜",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:chat_settings")]))
+        return
+
+    # [FIX1] 商城关键词设置
+    if data == "v4:set_shop_kw":
+        await q.answer()
+        context.user_data["await_shop_keywords"] = True
+        s = get_chat_settings(chat_id)
+        await safe_edit(q,
+            f"🛒 修改商城关键词\n"
+            f"当前：{s.get('shop_keywords','商城,兑换,商店')}\n\n"
+            f"请输入新关键词（多个用逗号分隔）：\n"
+            f"例如：商城,兑换,商店",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:chat_settings")]))
         return
 
     if data == "v4:set_rank_del":
@@ -1719,8 +1858,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"当前：{s.get('rank_delete_seconds', 120)} 秒\n\n"
             f"请输入新的自毁时间（秒，整数）：\n"
             f"• 输入 0 表示不自动删除\n"
-            f"• 建议范围：30 ~ 600\n\n"
-            f"发送 /cancel 可取消")
+            f"• 建议范围：30 ~ 600",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:chat_settings")]))
         return
 
     if data == "v4:set_redeem_notice":
@@ -1732,12 +1871,12 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📢 修改兑换通知文本\n"
             f"当前：{cur_notice}\n\n"
             f"请输入新的通知文本：\n"
-            f"发送「清空」可删除通知\n"
-            f"发送 /cancel 可取消")
+            f"发送「清空」可删除通知",
+            reply_markup=InlineKeyboardMarkup([kb_cancel("v4:chat_settings")]))
         return
 
 # =========================
-# 群内公开排行榜回调（翻页鉴权）
+# 群内公开排行榜回调
 # =========================
 async def cb_pub_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1759,8 +1898,8 @@ async def cb_pub_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = clamp(page, 0, max_page)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬅️", callback_data=f"v4:pub_rank:{max(0,page-1)}"),
-        InlineKeyboardButton(f"第{page+1}/{max_page+1}页", callback_data="v4:noop"),
-        InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:{min(max_page,page+1)}")]
+         InlineKeyboardButton(f"第{page+1}/{max_page+1}页", callback_data="v4:noop"),
+         InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:{min(max_page,page+1)}")]
     ])
     try:
         await q.edit_message_text(text=txt, reply_markup=kb, parse_mode="HTML")
@@ -1794,7 +1933,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("v4:u:shop:"):
         await q.answer()
         page = safe_int(data.split(":")[3], 0)
-        total = shop_count(chat_id)
+        total = shop_count_enabled(chat_id)
         if total == 0:
             await q.answer("🛒 暂无可兑换商品", show_alert=True)
             return
@@ -1829,7 +1968,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, confirm_text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 确认兑换", callback_data=f"v4:u:confirm:{item_id}"),
-                InlineKeyboardButton("❌ 取消", callback_data="v4:u:back")]
+                 InlineKeyboardButton("❌ 取消", callback_data="v4:u:back")]
             ]))
         return
 
@@ -1847,7 +1986,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"剩余余额：{milli_to_coin(bal)} 金币",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🛒 继续兑换", callback_data="v4:u:shop:0"),
-                    InlineKeyboardButton("🔙 返回钱包", callback_data="v4:u:back")]
+                     InlineKeyboardButton("🔙 返回钱包", callback_data="v4:u:back")]
                 ]))
         else:
             await safe_edit(q,
@@ -1875,8 +2014,8 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, txt,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️", callback_data=f"v4:u:logs:{max(0,page-1)}"),
-                InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
-                InlineKeyboardButton("➡️", callback_data=f"v4:u:logs:{min(max_page,page+1)}")],
+                 InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
+                 InlineKeyboardButton("➡️", callback_data=f"v4:u:logs:{min(max_page,page+1)}")],
                 [InlineKeyboardButton("🔙 返回钱包", callback_data="v4:u:back")]
             ]))
         return
@@ -1896,16 +2035,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok, chat_id = ensure_admin_selected_chat(user_id, context)
         v = chat_id if ok else 0
 
-        # 选择目标用户
         if context.user_data.get("await_target_input"):
             target = safe_int(text, 0)
             if not target:
-                await update.message.reply_text("❌ 格式错误，请输入纯数字用户ID\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入纯数字用户ID")
                 return
             context.user_data.pop("await_target_input", None)
             context.user_data["adm_target"] = target
             if ok:
-                bal = wallet_get(v, target)
                 await update.message.reply_text(
                     f"✅ 目标用户已设置为：{target}\n\n" + adm_user_text(v, target),
                     reply_markup=kb_adm_user())
@@ -1916,14 +2053,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ok:
             return
 
-        # 增加金币
         if context.user_data.get("await_adm_add"):
             try:
                 delta = coin_to_milli(text)
                 if delta <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入正数\n如：10 或 0.5\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入正数\n如：10 或 0.5")
                 return
             t = context.user_data.get("adm_target", user_id)
             ok2, msg = wallet_adjust_admin(v, user_id, t, delta, "panel_add")
@@ -1933,14 +2069,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_adm_user())
             return
 
-        # 扣除金币
         if context.user_data.get("await_adm_sub"):
             try:
                 delta = coin_to_milli(text)
                 if delta <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入正数\n如：10 或 0.5\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入正数\n如：10 或 0.5")
                 return
             t = context.user_data.get("adm_target", user_id)
             ok2, msg = wallet_adjust_admin(v, user_id, t, -delta, "panel_sub")
@@ -1950,7 +2085,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_adm_user())
             return
 
-        # 规则名称
         if context.user_data.get("await_rule_name"):
             rid = context.user_data.pop("await_rule_name")
             r = get_rule(v, rid)
@@ -1965,7 +2099,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_rule_edit(rid))
             return
 
-        # 规则概率
         if context.user_data.get("await_rule_prob"):
             rid = context.user_data.pop("await_rule_prob")
             r = get_rule(v, rid)
@@ -1979,7 +2112,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise ValueError
                 prob_val = pf / 100.0
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入 0~100 之间的数字\n如：5 或 5%\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入 0~100 之间的数字\n如：5 或 5%")
                 return
             _id, name, p, mn, mx, en, pr = r
             update_rule(v, rid, prob_val, int(mn), int(mx), bool(en), name)
@@ -1989,7 +2122,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_rule_edit(rid))
             return
 
-        # 规则最小值
         if context.user_data.get("await_rule_min"):
             rid = context.user_data.pop("await_rule_min")
             r = get_rule(v, rid)
@@ -2001,11 +2133,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if new_min <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入正数\n如：0.5 或 1\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入正数\n如：0.5 或 1")
                 return
             _id, name, p, mn, mx, en, pr = r
             if new_min > int(mx):
-                await update.message.reply_text(f"❌ 最小值不能大于最大值（当前最大：{milli_to_coin(int(mx))}）\n发送 /cancel 可取消")
+                await update.message.reply_text(
+                    f"❌ 最小值不能大于最大值（当前最大：{milli_to_coin(int(mx))}）")
                 context.user_data["await_rule_min"] = rid
                 return
             update_rule(v, rid, float(p), new_min, int(mx), bool(en), name)
@@ -2015,7 +2148,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_rule_edit(rid))
             return
 
-        # 规则最大值
         if context.user_data.get("await_rule_max"):
             rid = context.user_data.pop("await_rule_max")
             r = get_rule(v, rid)
@@ -2027,11 +2159,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if new_max <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入正数\n如：5 或 10\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入正数\n如：5 或 10")
                 return
             _id, name, p, mn, mx, en, pr = r
             if new_max < int(mn):
-                await update.message.reply_text(f"❌ 最大值不能小于最小值（当前最小：{milli_to_coin(int(mn))}）\n发送 /cancel 可取消")
+                await update.message.reply_text(
+                    f"❌ 最大值不能小于最小值（当前最小：{milli_to_coin(int(mn))}）")
                 context.user_data["await_rule_max"] = rid
                 return
             update_rule(v, rid, float(p), int(mn), new_max, bool(en), name)
@@ -2041,12 +2174,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_rule_edit(rid))
             return
 
-        # 新增商品
         if context.user_data.get("await_add_item_input"):
             context.user_data.pop("await_add_item_input", None)
             parts = [p.strip() for p in text.split("|")]
             if len(parts) < 2:
-                await update.message.reply_text("❌ 格式错误\n正确格式：标题|价格|库存|描述\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误\n正确格式：标题|价格|库存|描述")
                 context.user_data["await_add_item_input"] = True
                 return
             title = parts[0]
@@ -2055,7 +2187,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if price <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 价格格式错误，请输入正数\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 价格格式错误，请输入正数")
                 context.user_data["await_add_item_input"] = True
                 return
             stock_raw = parts[2].strip() if len(parts) > 2 else "∞"
@@ -2073,7 +2205,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_adm_shop(v, 0))
             return
 
-        # 商品名称
         if context.user_data.get("await_item_title"):
             item_id = context.user_data.pop("await_item_title")
             it = get_item(v, item_id)
@@ -2088,7 +2219,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_item_edit(item_id))
             return
 
-        # 商品描述
         if context.user_data.get("await_item_desc"):
             item_id = context.user_data.pop("await_item_desc")
             it = get_item(v, item_id)
@@ -2104,7 +2234,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_item_edit(item_id))
             return
 
-        # 商品价格
         if context.user_data.get("await_item_price"):
             item_id = context.user_data.pop("await_item_price")
             it = get_item(v, item_id)
@@ -2116,7 +2245,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if new_price <= 0:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("❌ 格式错误，请输入正数\n如：5 或 0.5\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 格式错误，请输入正数\n如：5 或 0.5")
                 context.user_data["await_item_price"] = item_id
                 return
             _id, title, price, stock, enabled, desc = it
@@ -2127,7 +2256,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_item_edit(item_id))
             return
 
-        # 商品库存
         if context.user_data.get("await_item_stock"):
             item_id = context.user_data.pop("await_item_stock")
             it = get_item(v, item_id)
@@ -2136,7 +2264,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             new_stock = safe_int(text, -1)
             if new_stock < 0:
-                await update.message.reply_text("❌ 请输入非负整数\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 请输入非负整数")
                 context.user_data["await_item_stock"] = item_id
                 return
             _id, title, price, stock, enabled, desc = it
@@ -2147,12 +2275,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_item_edit(item_id))
             return
 
-        # 排行榜关键词
         if context.user_data.get("await_rank_keywords"):
             context.user_data.pop("await_rank_keywords", None)
             kw = text.strip()
             if not kw:
-                await update.message.reply_text("❌ 关键词不能为空\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 关键词不能为空")
                 context.user_data["await_rank_keywords"] = True
                 return
             set_chat_setting(v, "rank_keywords", kw)
@@ -2161,12 +2288,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_chat_settings())
             return
 
-        # 排行榜自毁时间
+        # [FIX1] 商城关键词输入处理
+        if context.user_data.get("await_shop_keywords"):
+            context.user_data.pop("await_shop_keywords", None)
+            kw = text.strip()
+            if not kw:
+                await update.message.reply_text("❌ 关键词不能为空")
+                context.user_data["await_shop_keywords"] = True
+                return
+            set_chat_setting(v, "shop_keywords", kw)
+            await update.message.reply_text(
+                f"✅ 商城关键词已更新\n\n" + settings_text(v),
+                reply_markup=kb_chat_settings())
+            return
+
         if context.user_data.get("await_rank_delete_seconds"):
             context.user_data.pop("await_rank_delete_seconds", None)
             secs = safe_int(text, -1)
             if secs < 0:
-                await update.message.reply_text("❌ 请输入非负整数（秒）\n发送 /cancel 可取消")
+                await update.message.reply_text("❌ 请输入非负整数（秒）")
                 context.user_data["await_rank_delete_seconds"] = True
                 return
             set_chat_setting(v, "rank_delete_seconds", secs)
@@ -2175,7 +2315,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_chat_settings())
             return
 
-        # 兑换通知文本
         if context.user_data.get("await_redeem_notice"):
             context.user_data.pop("await_redeem_notice", None)
             new_notice = "" if text == "清空" else text
@@ -2187,24 +2326,46 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return  # 私聊无其他处理
 
-    # ── 群组：发放金币 + 排行榜关键词触发 ──
+    # ── 群组：发放金币 + 关键词触发 ──
     if chat_type in ("group", "supergroup"):
         chat_id = update.effective_chat.id
         msg_text = update.message.text or ""
-
-        # 排行榜关键词触发
         settings = get_chat_settings(chat_id)
+
+        # [FIX2] 排行榜关键词触发
         kw_list = [k.strip() for k in settings.get("rank_keywords", "排行榜,排名,积分榜").split(",") if k.strip()]
         if msg_text.strip() in kw_list:
             txt, max_page = rank_text(chat_id, 0)
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️", callback_data="v4:pub_rank:0"),
-                InlineKeyboardButton(f"第1/{max_page+1}页", callback_data="v4:noop"),
-                InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:1")]
+                 InlineKeyboardButton(f"第1/{max_page+1}页", callback_data="v4:noop"),
+                 InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:1")]
             ])
             bot_msg = await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
-            # 记录唤起人
             context.bot_data[f"rank_owner_{chat_id}_{bot_msg.message_id}"] = user_id
+            rd = settings.get("rank_delete_seconds", 120)
+            await auto_delete_pair(
+                context=context,
+                chat_id=chat_id,
+                trigger_mid=update.message.message_id,
+                bot_mid=bot_msg.message_id,
+                delay=rd
+            )
+            return
+
+        skw_list = [k.strip() for k in settings.get("shop_keywords", "商城,兑换,商店").split(",") if k.strip()]
+        if msg_text.strip() in skw_list:
+            total = shop_count_enabled(chat_id)
+            if total == 0:
+                bot_msg = await update.message.reply_text("🛒 暂时没有可兑换的商品")
+            else:
+                bot_msg = await update.message.reply_text(
+                    f"🛒 兑换商品\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"点击商品按钮即可兑换\n"
+                    f"格式：编号. 名称  -价格金币  库存",
+                    reply_markup=kb_user_shop(chat_id, 0)
+                )
             rd = settings.get("rank_delete_seconds", 120)
             await auto_delete_pair(
                 context=context,
@@ -2218,6 +2379,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 金币发放
         if not valid_text_basic(msg_text, MIN_TEXT_LEN):
             return
+        # [FIX2] 发放时记录用户姓名
+        u = update.effective_user
+        display_name = fmt_display_name(u.first_name, u.last_name, u.username, user_id)
         if not can_reward(chat_id, user_id, msg_text):
             return
         rules = list_rules(chat_id)
@@ -2236,7 +2400,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rid, name, prob, mn, mx, en, pr = won
         amount = random.randint(int(mn), int(mx))
-        wallet_add(chat_id, user_id, amount)
+        wallet_add(chat_id, user_id, amount, display_name=display_name)
         add_daily(chat_id, user_id, amount)
 
 # =========================
@@ -2272,7 +2436,6 @@ def main():
 
     app.add_error_handler(on_error)
 
-    # 命令
     app.add_handler(CommandHandler("start", cmd_start_group))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -2280,12 +2443,10 @@ def main():
     app.add_handler(CommandHandler("unbind_admin", cmd_unbind_admin))
     app.add_handler(CommandHandler("buy", cmd_buy))
 
-    # 回调
     app.add_handler(CallbackQueryHandler(cb_pub_rank, pattern=r"^v4:pub_rank:"))
     app.add_handler(CallbackQueryHandler(cb_user, pattern=r"^v4:u:"))
     app.add_handler(CallbackQueryHandler(cb, pattern=r"^v4:"))
 
-    # 文本
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     if WEBHOOK_URL:
