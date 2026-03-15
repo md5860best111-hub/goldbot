@@ -176,7 +176,6 @@ def init_db(conn):
           id BIGSERIAL PRIMARY KEY,
           chat_id BIGINT NOT NULL,
           title TEXT NOT NULL,
-          description TEXT NOT NULL DEFAULT '',
           price_milli BIGINT NOT NULL,
           enabled BOOLEAN NOT NULL DEFAULT TRUE,
           stock INT NULL,
@@ -202,7 +201,6 @@ def init_db(conn):
           user_id BIGINT NOT NULL,
           delta_milli BIGINT NOT NULL,
           reason TEXT NOT NULL DEFAULT '',
-          log_type TEXT NOT NULL DEFAULT 'admin',
           created_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
@@ -214,6 +212,30 @@ def init_db(conn):
           updated_at TIMESTAMP NOT NULL DEFAULT NOW()
         );
         """)
+
+        # ⚠️ 先补列，再建依赖这些列的索引
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='coin_logs' AND column_name='log_type'
+          ) THEN
+            ALTER TABLE coin_logs ADD COLUMN log_type TEXT NOT NULL DEFAULT 'admin';
+          END IF;
+        END $$;
+        """)
+        cur.execute("""
+        DO $$ BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='shop_items' AND column_name='description'
+          ) THEN
+            ALTER TABLE shop_items ADD COLUMN description TEXT NOT NULL DEFAULT '';
+          END IF;
+        END $$;
+        """)
+
+        # 建索引（列已确保存在）
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_admins_user ON chat_admins(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rules_chat ON drop_rules(chat_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_shop_chat ON shop_items(chat_id);")
