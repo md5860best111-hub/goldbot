@@ -1245,6 +1245,8 @@ async def notify_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buye
         bal = wallet_get(chat_id, buyer_id)
         settings = get_chat_settings(chat_id)
         notice_extra = settings.get("redeem_notice", "").strip()
+
+        # ── 1. 群内公开通知 ──
         group_text = (
             f"🧾 兑换通知\n"
             f"用户：<a href=\"tg://user?id={buyer_id}\">{buyer_id}</a>\n"
@@ -1255,6 +1257,32 @@ async def notify_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buye
         if notice_extra:
             group_text += f"\n\n📌 {notice_extra}"
         await context.bot.send_message(chat_id=chat_id, text=group_text, parse_mode="HTML")
+
+        # ── 2. 私信群组所有管理员 ──
+        admin_ids = list_chat_admin_ids(chat_id)
+        admin_text = (
+            f"🛒 有新的兑换订单！\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"群组：{chat_id}\n"
+            f"买家：<a href=\"tg://user?id={buyer_id}\">{buyer_id}</a>\n"
+            f"商品：{title}\n"
+            f"花费：-{milli_to_coin(price)} 金币\n"
+            f"买家余额：{milli_to_coin(bal)} 金币\n"
+            f"库存剩余：{'∞' if stock is None else max(0, (stock or 0))}"
+        )
+        if desc:
+            admin_text += f"\n描述：{desc}"
+        if notice_extra:
+            admin_text += f"\n\n📌 {notice_extra}"
+        for admin_id in admin_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_text,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass  # 管理员可能未启动过 bot，忽略发送失败
     except Exception:
         logger.exception("notify_purchase failed")
 
