@@ -1916,7 +1916,15 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     chat_id = q.message.chat_id
+    msg_id = q.message.message_id
     data = q.data or ""
+
+    # 群内消息：只有唤起人才能操作
+    if q.message.chat.type in ("group", "supergroup"):
+        owner = context.bot_data.get(f"shop_owner_{chat_id}_{msg_id}")
+        if owner is not None and uid != owner:
+            await q.answer("❌ 只有发送该消息的用户才能操作", show_alert=True)
+            return
 
     if data == "v4:u:back":
         await q.answer()
@@ -2339,7 +2347,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️", callback_data="v4:pub_rank:0"),
                  InlineKeyboardButton(f"第1/{max_page+1}页", callback_data="v4:noop"),
-                 InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:1")]
+                 InlineKeyboardButton("➡️", callback_data=f"v4:pub_rank:{min(1, max_page)}")]
             ])
             bot_msg = await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
             context.bot_data[f"rank_owner_{chat_id}_{bot_msg.message_id}"] = user_id
@@ -2366,6 +2374,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"格式：编号. 名称  -价格金币  库存",
                     reply_markup=kb_user_shop(chat_id, 0)
                 )
+            context.bot_data[f"shop_owner_{chat_id}_{bot_msg.message_id}"] = user_id
             rd = settings.get("rank_delete_seconds", 120)
             await auto_delete_pair(
                 context=context,
@@ -2414,11 +2423,13 @@ async def cmd_start_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
-    await update.message.reply_text(
+    bot_msg = await update.message.reply_text(
         user_panel_text(chat_id, uid),
         reply_markup=kb_user_panel(),
         parse_mode="HTML"
     )
+    # 群内钱包面板：只有本人才能操作
+    context.bot_data[f"shop_owner_{chat_id}_{bot_msg.message_id}"] = uid
 
 # =========================
 # main
