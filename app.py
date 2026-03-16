@@ -887,9 +887,7 @@ def console_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
     title = selected_chat_title(context) or str(cid)
     return (
         f"🏠 管理控制台\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 当前群组：{title}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"所有操作均作用于上方群组，切换群组请点击底部按钮。"
     )
 
@@ -897,10 +895,8 @@ def adm_user_text(chat_id: int, target: int) -> str:
     bal = wallet_get(chat_id, target)
     return (
         f"💰 金币管理\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"目标用户：{target}\n"
         f"当前余额：{milli_to_coin(bal)} 金币\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"📖 说明：\n"
         f"• 先点「选择用户」输入用户ID\n"
         f"• 再点「增加」或「扣除」输入金额\n"
@@ -949,7 +945,6 @@ def item_detail_text(it) -> str:
     _id, title, price, stock, enabled, desc = it
     lines = [
         f"🎁 商品详情",
-        f"━━━━━━━━━━━━━━━━━━",
         f"编号：{_id}",
         f"名称：{title}",
         f"价格：{milli_to_coin(price)} 金币",
@@ -964,12 +959,10 @@ def rule_detail_text(r) -> str:
     _id, name, p, mn, mx, en, pr = r
     return (
         f"⚙️ 规则详情\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"名称：{name}\n"
         f"概率：{p*100:.4f}%\n"
         f"金额范围：{milli_to_coin(mn)} ~ {milli_to_coin(mx)} 金币\n"
         f"状态：{'✅ 开启' if en else '❌ 关闭'}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"📖 概率格式：输入 5 或 5% 均表示5%"
     )
 
@@ -981,12 +974,10 @@ def settings_text(chat_id: int) -> str:
     rd = s.get("rank_delete_seconds", 120)
     return (
         f"⚙️ 群组设置\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"🔑 排行榜关键词：{kw}\n"
         f"🛒 商城关键词：{skw}\n"
         f"⏱ 排行榜自毁时间：{rd} 秒\n"
         f"📢 兑换通知文本：{notice}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"📖 说明：\n"
         f"• 排行榜/商城关键词：逗号分隔，群内发送即触发\n"
         f"• 自毁时间：排行榜消息多少秒后自动删除（0=不删除）\n"
@@ -997,10 +988,8 @@ def user_panel_text(chat_id: int, user_id: int) -> str:
     bal = wallet_get(chat_id, user_id)
     return (
         f"🛍️ 我的钱包\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"用户：<a href=\"tg://user?id={user_id}\">{user_id}</a>\n"
         f"余额：{milli_to_coin(bal)} 金币\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"点击下方按钮兑换商品或查看记录"
     )
 
@@ -1262,7 +1251,6 @@ async def notify_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buye
         admin_ids = list_chat_admin_ids(chat_id)
         admin_text = (
             f"🛒 有新的兑换订单！\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"群组：{chat_id}\n"
             f"买家：<a href=\"tg://user?id={buyer_id}\">{buyer_id}</a>\n"
             f"商品：{title}\n"
@@ -1553,10 +1541,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = wallet_get(chat_id, t)
         await safe_edit(q,
             f"➕ 增加金币\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"目标用户：{t}\n"
             f"当前余额：{milli_to_coin(bal)} 金币\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"请输入要增加的金币数量\n"
             f"支持小数，如：10 或 0.5",
             reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_user")]))
@@ -1569,10 +1555,8 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = wallet_get(chat_id, t)
         await safe_edit(q,
             f"➖ 扣除金币\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"目标用户：{t}\n"
             f"当前余额：{milli_to_coin(bal)} 金币\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"请输入要扣除的金币数量\n"
             f"支持小数，如：10 或 0.5",
             reply_markup=InlineKeyboardMarkup([kb_cancel("v4:adm_user")]))
@@ -1591,7 +1575,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ensure_default_rules(chat_id)
         await safe_edit(q,
             f"⚙️ 抽奖规则管理\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"点击规则可编辑，✅=开启 ❌=关闭",
             reply_markup=kb_adm_rules(chat_id, page))
         return
@@ -1740,7 +1723,6 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = safe_int(data.split(":")[2], 0)
         await safe_edit(q,
             f"🎁 商品管理\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"✅=上架 ❌=下架\n"
             f"格式：编号. 名称｜-价格金币｜库存件",
             reply_markup=kb_adm_shop(chat_id, page))
@@ -1993,7 +1975,6 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = wallet_get(chat_id, uid)
         confirm_text = (
             f"🛒 确认兑换\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"商品：{title}\n"
             f"价格：-{milli_to_coin(price)} 金币\n"
             f"库存：{'∞' if stock is None else stock}\n"
@@ -2001,7 +1982,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if desc:
             confirm_text += f"描述：{desc}\n"
-        confirm_text += f"━━━━━━━━━━━━━━━━━━\n确认兑换吗？"
+        confirm_text += f"\n确认兑换吗？"
         await safe_edit(q, confirm_text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ 确认兑换", callback_data=f"v4:u:confirm:{item_id}"),
@@ -2018,7 +1999,6 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bal = wallet_get(chat_id, uid)
             await safe_edit(q,
                 f"✅ 兑换成功！\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
                 f"{msg}\n"
                 f"剩余余额：{milli_to_coin(bal)} 金币",
                 reply_markup=InlineKeyboardMarkup([
@@ -2233,7 +2213,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_item(v, title, price, stock, description)
             await update.message.reply_text(
                 f"✅ 商品添加成功！\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
                 f"名称：{title}\n"
                 f"价格：-{milli_to_coin(price)} 金币\n"
                 f"库存：{'∞' if stock is None else stock}\n"
@@ -2399,9 +2378,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bal = wallet_get(chat_id, user_id)
                 bot_msg = await update.message.reply_text(
                     f"🛒 兑换商品\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
                     f"💰 我的余额：<b>{milli_to_coin(bal)}</b> 金币\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
                     f"点击商品按钮即可兑换",
                     reply_markup=kb_user_shop(chat_id, 0),
                     parse_mode="HTML"
@@ -2443,42 +2420,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = random.randint(int(mn), int(mx))
         wallet_add(chat_id, user_id, amount, display_name=display_name)
         add_daily(chat_id, user_id, amount)
-        # 中奖通知（60秒自毁）
+        # 中奖通知
         bal_after = wallet_get(chat_id, user_id)
         try:
-            if amount >= 10000:
-                header = "🌊🦄🌊 锦 鲤 附 体 🌊🦄🌊"
-                congrats = "恭喜你触发了最高奖励！"
-                emoji = "🎊🎊🎊"
-            elif amount >= 1000:
-                header = "✨🎁✨ 惊 喜 大 奖 ✨🎁✨"
-                congrats = "恭喜你获得惊喜大奖！"
-                emoji = "🎉🎉"
-            else:
-                header = "🎰 金 币 掉 落"
-                congrats = "恭喜你获得金币！"
-                emoji = "🪙"
-
-            # 取商城关键词第一个作为提示
             shop_kw_hint = settings.get("shop_keywords", "商城,兑换,商店").split(",")[0].strip()
-
             win_msg = (
-                f"{header}\n"
-                f"👤 <a href=\"tg://user?id={user_id}\">{display_name}</a>\n"
-                f"🎖 等级：<b>{name}</b>\n"
-                f"💰 获得：<b>+{milli_to_coin(amount)}</b> 金币\n"
+                f"🧧 恭喜 <a href=\"tg://user?id={user_id}\">{display_name}</a> 中奖！\n"
+                f"🎖 等级：{name}\n"
+                f"💰 获得：+{milli_to_coin(amount)} 金币\n"
                 f"👜 余额：{milli_to_coin(bal_after)} 金币\n"
-                f"{congrats} {emoji}\n"
                 f"💡 发送「{shop_kw_hint}」可兑换商品"
             )
-            win_bot_msg = await update.message.reply_text(win_msg, parse_mode="HTML")
-            await auto_delete_pair(
-                context=context,
-                chat_id=chat_id,
-                trigger_mid=update.message.message_id,
-                bot_mid=win_bot_msg.message_id,
-                delay=60
-            )
+            await update.message.reply_text(win_msg, parse_mode="HTML")
         except Exception:
             pass
 
