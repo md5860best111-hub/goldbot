@@ -1976,9 +1976,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = wallet_get(chat_id, uid)
         await safe_edit(q,
             f"🛒 兑换商品\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"💰 我的余额：<b>{milli_to_coin(bal)}</b> 金币\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"点击商品按钮即可兑换",
             reply_markup=kb_user_shop(chat_id, page),
             parse_mode="HTML")
@@ -2445,39 +2443,42 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = random.randint(int(mn), int(mx))
         wallet_add(chat_id, user_id, amount, display_name=display_name)
         add_daily(chat_id, user_id, amount)
-        # 中奖通知
+        # 中奖通知（60秒自毁）
         bal_after = wallet_get(chat_id, user_id)
         try:
-            # 根据规则名/金额大小选不同风格
             if amount >= 10000:
                 header = "🌊🦄🌊 锦 鲤 附 体 🌊🦄🌊"
-                banner = "═" * 20
+                congrats = "恭喜你触发了最高奖励！"
                 emoji = "🎊🎊🎊"
             elif amount >= 1000:
                 header = "✨🎁✨ 惊 喜 大 奖 ✨🎁✨"
-                banner = "─" * 20
+                congrats = "恭喜你获得惊喜大奖！"
                 emoji = "🎉🎉"
             else:
                 header = "🎰 金 币 掉 落"
-                banner = "─" * 18
+                congrats = "恭喜你获得金币！"
                 emoji = "🪙"
 
-            coin_bar_total = 10
-            filled = max(1, min(coin_bar_total, round(amount / int(mx) * coin_bar_total)))
-            coin_bar = "█" * filled + "░" * (coin_bar_total - filled)
+            # 取商城关键词第一个作为提示
+            shop_kw_hint = settings.get("shop_keywords", "商城,兑换,商店").split(",")[0].strip()
 
-            msg = (
+            win_msg = (
                 f"{header}\n"
-                f"{banner}\n"
                 f"👤 <a href=\"tg://user?id={user_id}\">{display_name}</a>\n"
-                f"🎁 奖项：<b>{name}</b>\n"
+                f"🎖 等级：<b>{name}</b>\n"
                 f"💰 获得：<b>+{milli_to_coin(amount)}</b> 金币\n"
-                f"[{coin_bar}]\n"
                 f"👜 余额：{milli_to_coin(bal_after)} 金币\n"
-                f"{banner}\n"
-                f"{emoji}"
+                f"{congrats} {emoji}\n"
+                f"💡 发送「{shop_kw_hint}」可兑换商品"
             )
-            await update.message.reply_text(msg, parse_mode="HTML")
+            win_bot_msg = await update.message.reply_text(win_msg, parse_mode="HTML")
+            await auto_delete_pair(
+                context=context,
+                chat_id=chat_id,
+                trigger_mid=update.message.message_id,
+                bot_mid=win_bot_msg.message_id,
+                delay=60
+            )
         except Exception:
             pass
 
