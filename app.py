@@ -1268,7 +1268,7 @@ async def notify_purchase(context: ContextTypes.DEFAULT_TYPE, chat_id: int, buye
             f"商品：{title}\n"
             f"花费：-{milli_to_coin(price)} 金币\n"
             f"买家余额：{milli_to_coin(bal)} 金币\n"
-            f"库存剩余：{'∞' if stock is None else max(0, (stock or 0))}"
+            f"库存剩余：{'∞' if stock is None else max(0, stock)}"
         )
         if desc:
             admin_text += f"\n描述：{desc}"
@@ -1973,12 +1973,15 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total == 0:
             await q.answer("🛒 暂无可兑换商品", show_alert=True)
             return
+        bal = wallet_get(chat_id, uid)
         await safe_edit(q,
             f"🛒 兑换商品\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"点击商品按钮即可兑换\n"
-            f"格式：编号. 名称  -价格金币  库存",
-            reply_markup=kb_user_shop(chat_id, page))
+            f"💰 我的余额：<b>{milli_to_coin(bal)}</b> 金币\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"点击商品按钮即可兑换",
+            reply_markup=kb_user_shop(chat_id, page),
+            parse_mode="HTML")
         return
 
     if data.startswith("v4:u:buy:"):
@@ -2395,12 +2398,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if total == 0:
                 bot_msg = await update.message.reply_text("🛒 暂时没有可兑换的商品")
             else:
+                bal = wallet_get(chat_id, user_id)
                 bot_msg = await update.message.reply_text(
                     f"🛒 兑换商品\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"点击商品按钮即可兑换\n"
-                    f"格式：编号. 名称  -价格金币  库存",
-                    reply_markup=kb_user_shop(chat_id, 0)
+                    f"💰 我的余额：<b>{milli_to_coin(bal)}</b> 金币\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"点击商品按钮即可兑换",
+                    reply_markup=kb_user_shop(chat_id, 0),
+                    parse_mode="HTML"
                 )
             context.bot_data[f"shop_owner_{chat_id}_{bot_msg.message_id}"] = user_id
             rd = settings.get("rank_delete_seconds", 120)
@@ -2439,6 +2445,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = random.randint(int(mn), int(mx))
         wallet_add(chat_id, user_id, amount, display_name=display_name)
         add_daily(chat_id, user_id, amount)
+        # 中奖通知
+        bal_after = wallet_get(chat_id, user_id)
+        try:
+            # 根据规则名/金额大小选不同风格
+            if amount >= 10000:
+                header = "🌊🦄🌊 锦 鲤 附 体 🌊🦄🌊"
+                banner = "═" * 20
+                emoji = "🎊🎊🎊"
+            elif amount >= 1000:
+                header = "✨🎁✨ 惊 喜 大 奖 ✨🎁✨"
+                banner = "─" * 20
+                emoji = "🎉🎉"
+            else:
+                header = "🎰 金 币 掉 落"
+                banner = "─" * 18
+                emoji = "🪙"
+
+            coin_bar_total = 10
+            filled = max(1, min(coin_bar_total, round(amount / int(mx) * coin_bar_total)))
+            coin_bar = "█" * filled + "░" * (coin_bar_total - filled)
+
+            msg = (
+                f"{header}\n"
+                f"{banner}\n"
+                f"👤 <a href=\"tg://user?id={user_id}\">{display_name}</a>\n"
+                f"🎁 奖项：<b>{name}</b>\n"
+                f"💰 获得：<b>+{milli_to_coin(amount)}</b> 金币\n"
+                f"[{coin_bar}]\n"
+                f"👜 余额：{milli_to_coin(bal_after)} 金币\n"
+                f"{banner}\n"
+                f"{emoji}"
+            )
+            await update.message.reply_text(msg, parse_mode="HTML")
+        except Exception:
+            pass
 
 # =========================
 # 用户钱包面板（群内 /start）
