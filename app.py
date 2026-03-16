@@ -2384,13 +2384,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
             context.bot_data[f"shop_owner_{chat_id}_{bot_msg.message_id}"] = user_id
-            rd = settings.get("rank_delete_seconds", 120)
             await auto_delete_pair(
                 context=context,
                 chat_id=chat_id,
                 trigger_mid=update.message.message_id,
                 bot_mid=bot_msg.message_id,
-                delay=rd
+                delay=60
             )
             return
 
