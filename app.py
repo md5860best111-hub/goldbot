@@ -480,6 +480,73 @@ def wallet_adjust_admin(conn, chat_id: int, operator_id: int,
         return True, f"用户 {user_id} 变动 {milli_to_coin(delta)} 金币，新余额 {milli_to_coin(new)} 金币"
 
 @with_conn
+def wallet_transfer_atomic(conn, chat_id: int, from_user_id: int, to_user_id: int, amount_milli: int):
+    """
+    群内用户转账（原子）
+    - 同一 chat_id 内转账，不可跨群
+    - 扣减转出方，增加转入方
+    - 写 transfer 日志（双边）
+    """
+    if amount_milli <= 0:
+        return False, "金额必须大于 0"
+    if from_user_id == to_user_id:
+        return False, "不能给自己转账"
+
+    with conn.cursor() as cur:
+        # 锁定转出方
+        cur.execute("""
+        SELECT balance_milli FROM wallets
+        WHERE chat_id=%s AND user_id=%s
+        FOR UPDATE
+        """, (chat_id, from_user_id))
+        row_from = cur.fetchone()
+        from_bal = int(row_from[0]) if row_from else 0
+
+        if from_bal < amount_milli:
+            return False, f"余额不足（当前 {milli_to_coin(from_bal)} 金币）"
+
+        # 锁定转入方（若不存在后续 UPSERT 创建）
+        cur.execute("""
+        SELECT balance_milli FROM wallets
+        WHERE chat_id=%s AND user_id=%s
+        FOR UPDATE
+        """, (chat_id, to_user_id))
+        row_to = cur.fetchone()
+        to_bal = int(row_to[0]) if row_to else 0
+
+        new_from = from_bal - amount_milli
+        new_to = to_bal + amount_milli
+
+        # 更新转出方
+        cur.execute("""
+        INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
+        VALUES(%s,%s,%s,NOW())
+        ON CONFLICT(chat_id,user_id)
+        DO UPDATE SET balance_milli=%s,updated_at=NOW()
+        """, (chat_id, from_user_id, new_from, new_from))
+
+        # 更新转入方
+        cur.execute("""
+        INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
+        VALUES(%s,%s,%s,NOW())
+        ON CONFLICT(chat_id,user_id)
+        DO UPDATE SET balance_milli=%s,updated_at=NOW()
+        """, (chat_id, to_user_id, new_to, new_to))
+
+        # 日志：转出（负）
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+        VALUES(%s,%s,%s,%s,%s,'transfer')
+        """, (chat_id, from_user_id, from_user_id, -amount_milli, f"to:{to_user_id}"))
+
+        # 日志：转入（正）
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+        VALUES(%s,%s,%s,%s,%s,'transfer')
+        """, (chat_id, from_user_id, to_user_id, amount_milli, f"from:{from_user_id}"))
+
+        return True, (new_from, new_to)
+@with_conn
 def get_all_wallets(conn, chat_id: int, limit=15, offset=0):
     with conn.cursor() as cur:
         cur.execute("""
@@ -1007,7 +1074,8 @@ def kb_logs(chat_id: int, page: int, log_type: str = "all"):
         return InlineKeyboardButton(f"{marker}{label}", callback_data=f"v4:logs:0:{lt}")
     return InlineKeyboardMarkup([
         [_btn("全部", "all"), _btn("发放", "drop"),
-         _btn("兑换", "redeem"), _btn("管理", "admin")],
+         _btn("兑换", "redeem"), _btn("管理", "admin"),
+         _btn("转账", "transfer")],
         [InlineKeyboardButton("⬅️", callback_data=f"v4:logs:{max(0,page-1)}:{log_type}"),
          InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
          InlineKeyboardButton("➡️", callback_data=f"v4:logs:{min(max_page,page+1)}:{log_type}")],
@@ -1104,6 +1172,7 @@ async def post_init(app):
                 BotCommand("start", "打开面板"),
                 BotCommand("myid", "查看我的ID"),
                 BotCommand("buy", "兑换商品：/buy 商品编号"),
+                BotCommand("pay", "转账：回复用户消息后 /pay 金额"),  # 新增
                 BotCommand("cancel", "取消当前输入"),
             ],
             scope=BotCommandScopeDefault()
@@ -1112,13 +1181,13 @@ async def post_init(app):
             commands=[
                 BotCommand("start", "打开管理面板"),
                 BotCommand("myid", "查看我的ID"),
+                BotCommand("pay", "转账：回复用户消息后 /pay 金额"),  # 新增
                 BotCommand("cancel", "取消当前输入"),
             ],
             scope=BotCommandScopeAllPrivateChats()
         )
     except Exception:
         logger.exception("post_init set_my_commands failed")
-
 # =========================
 # 兑换通知
 # =========================
@@ -1362,6 +1431,75 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
     if ok:
         await notify_purchase(context, chat_id, uid, real_item_id)
+
+async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    仅支持：回复某人消息 /pay 10
+    规则：
+    - 仅群组可用
+    - 仅白名单群可用
+    - 不能给自己转
+    - 金额必须 > 0
+    - 转账不跨群（按当前 chat_id 钱包记账）
+    """
+    if not update.effective_user or not update.message or not update.effective_chat:
+        return
+
+    chat = update.effective_chat
+    # 私聊不支持
+    if chat.type == "private":
+        await update.message.reply_text("请在群组内回复对方消息使用：/pay 金额")
+        return
+
+    chat_id = chat.id
+    if not is_allowed_chat(chat_id):
+        return
+
+    # 必须回复某人的消息
+    reply = update.message.reply_to_message
+    if not reply or not reply.from_user:
+        await update.message.reply_text("❌ 请先回复对方消息，再发送：/pay 金额\n例如：/pay 10")
+        return
+
+    from_uid = update.effective_user.id
+    to_uid = reply.from_user.id
+
+    # 禁止给机器人转（可选但建议）
+    if reply.from_user.is_bot:
+        await update.message.reply_text("❌ 不能给机器人转账")
+        return
+
+    if from_uid == to_uid:
+        await update.message.reply_text("❌ 不能给自己转账")
+        return
+
+    # 解析金额：只取第一个参数
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text("❌ 请输入金额\n例如：/pay 10")
+        return
+
+    try:
+        amount_milli = coin_to_milli(args[0])
+        if amount_milli <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("❌ 金额格式错误，请输入正数（如 10 或 0.5）")
+        return
+
+    ok, result = wallet_transfer_atomic(chat_id, from_uid, to_uid, amount_milli)
+    if not ok:
+        await update.message.reply_text(f"❌ {result}")
+        return
+
+    new_from, new_to = result
+    await update.message.reply_text(
+        f"💸 转账成功\n"
+        f"转给 <a href=\"tg://user?id={to_uid}\">{to_uid}</a>：{milli_to_coin(amount_milli)} 金币\n"
+        f"你的余额：{milli_to_coin(new_from)} 金币\n"
+        f"对方余额：{milli_to_coin(new_to)} 金币",
+        parse_mode="HTML"
+    )
 
 # =========================
 # Callback Handler（管理面板）
@@ -1627,7 +1765,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_type = parts[3] if len(parts) > 3 else "all"
         lt_filter = log_type if log_type != "all" else None
         logs = coin_logs_page(chat_id, LOG_SIZE, page * LOG_SIZE, lt_filter)
-        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧"}
+        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸"}
         lines = [f"🧾 操作日志（{log_type}）\n"]
         for row in logs:
             lid, op, tgt, delta, reason, ts, lt = row
@@ -1980,7 +2118,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
         page = clamp(page, 0, max_page)
         logs = user_coin_logs_page(chat_id, uid, LOG_SIZE, page * LOG_SIZE)
-        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧"}
+        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸"}
         lines = [f"📋 我的金币记录\n"]
         for row in logs:
             lid, op, tgt, delta, reason, ts, lt = row
@@ -2433,6 +2571,7 @@ def main():
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("buy", cmd_buy))
+    app.add_handler(CommandHandler("pay", cmd_pay))
 
     app.add_handler(CallbackQueryHandler(cb_pub_rank, pattern=r"^v4:pub_rank:"))
     app.add_handler(CallbackQueryHandler(cb_user,     pattern=r"^v4:u:"))
