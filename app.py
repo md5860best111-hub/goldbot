@@ -1672,8 +1672,9 @@ async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pc28_period_text(period_row, bets, is_current=True),
             parse_mode="HTML"
         )
+        # 只删触发指令消息，公告消息不自毁
         auto_delete_pair(context, chat_id,
-            update.message.message_id, bot_msg.message_id, 30)
+            update.message.message_id, update.message.message_id, 10)
         # 若任务意外停了则重启
         existing = _pc28_tasks.get(chat_id)
         if existing is None or existing.done():
@@ -1691,8 +1692,9 @@ async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pc28_period_text(period_row, bets, is_current=True),
         parse_mode="HTML"
     )
+    # 只删触发指令消息，公告消息不自毁（由游戏流程管理）
     auto_delete_pair(context, chat_id,
-        update.message.message_id, msg.message_id, 30)
+        update.message.message_id, update.message.message_id, 10)
     existing = _pc28_tasks.get(chat_id)
     if existing is None or existing.done():
         task = asyncio.create_task(
