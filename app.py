@@ -4,6 +4,8 @@ import random
 import logging
 import asyncio
 import time
+import uuid
+import datetime
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlparse
 from functools import wraps
@@ -297,6 +299,65 @@ def init_db(conn):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_coin_logs_type ON coin_logs(chat_id, log_type, created_at DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_redeem_orders_chat ON redeem_orders(chat_id, created_at DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_wallets_chat ON wallets(chat_id, balance_milli DESC);")
+
+        # ── 红包主表 ──
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS redpacks (
+          pack_id      TEXT PRIMARY KEY,
+          chat_id      BIGINT NOT NULL,
+          sender_id    BIGINT NOT NULL,
+          sender_name  TEXT NOT NULL DEFAULT '',
+          total_milli  BIGINT NOT NULL,
+          remain_milli BIGINT NOT NULL,
+          total_count  INT NOT NULL,
+          remain_count INT NOT NULL,
+          status       TEXT NOT NULL DEFAULT 'open',
+          created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+          expire_at    TIMESTAMP NOT NULL
+        );
+        """)
+        # ── 红包抢记录 ──
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS redpack_records (
+          id           BIGSERIAL PRIMARY KEY,
+          pack_id      TEXT NOT NULL,
+          chat_id      BIGINT NOT NULL,
+          user_id      BIGINT NOT NULL,
+          user_name    TEXT NOT NULL DEFAULT '',
+          amount_milli BIGINT NOT NULL,
+          grabbed_at   TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """)
+        # ── PC28 期表 ──
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pc28_periods (
+          id       BIGSERIAL PRIMARY KEY,
+          chat_id  BIGINT NOT NULL,
+          period   INT NOT NULL,
+          open_at  TIMESTAMP NOT NULL,
+          status   TEXT NOT NULL DEFAULT 'betting',
+          result   TEXT,
+          UNIQUE(chat_id, period)
+        );
+        """)
+        # ── PC28 注单表 ──
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS pc28_bets (
+          id           BIGSERIAL PRIMARY KEY,
+          chat_id      BIGINT NOT NULL,
+          period_id    BIGINT NOT NULL,
+          user_id      BIGINT NOT NULL,
+          user_name    TEXT NOT NULL DEFAULT '',
+          bet_type     TEXT NOT NULL,
+          amount_milli BIGINT NOT NULL,
+          status       TEXT NOT NULL DEFAULT 'pending',
+          payout_milli BIGINT NOT NULL DEFAULT 0
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rp_chat ON redpacks(chat_id, status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rpr_pack ON redpack_records(pack_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pc28_period ON pc28_periods(chat_id, status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pc28_bets ON pc28_bets(period_id, chat_id);")
 
 @with_conn
 def migrate_db(conn):
@@ -742,6 +803,937 @@ def buy_item_atomic(conn, chat_id: int, user_id: int, item_id: int):
         VALUES(%s,%s,%s,%s,%s,'redeem')
         """, (chat_id, user_id, user_id, -int(price), f"buy:{item_id}:{title}"))
         return True, f"✅ 兑换成功：{title}（-{milli_to_coin(price)} 金币）"
+    
+# =========================
+# ██████╗ ███████╗██████╗ ██████╗  █████╗  ██████╗██╗  ██╗
+# ██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██║ ██╔╝
+# ██████╔╝█████╗  ██║  ██║██████╔╝███████║██║     █████╔╝
+# ██╔══██╗██╔══╝  ██║  ██║██╔═══╝ ██╔══██║██║     ██╔═██╗
+# ██║  ██║███████╗██████╔╝██║     ██║  ██║╚██████╗██║  ██╗
+# 红包功能
+# =========================
+
+REDPACK_EXPIRE_SECONDS = 120   # 红包有效期（秒）
+REDPACK_MIN_MILLI      = 10    # 单个红包最小金额（0.01金币）
+REDPACK_MAX_COUNT      = 100   # 单次最多几个红包
+REDPACK_MAX_TOTAL      = 100_000_000  # 单次最多总金额（milli）
+
+# ---------- DB ----------
+
+@with_conn
+def rp_create(conn, pack_id: str, chat_id: int, sender_id: int,
+              sender_name: str, total_milli: int, count: int, expire_seconds: int):
+    with conn.cursor() as cur:
+        # 先扣钱（原子）
+        cur.execute("""
+        SELECT balance_milli FROM wallets
+        WHERE chat_id=%s AND user_id=%s FOR UPDATE
+        """, (chat_id, sender_id))
+        row = cur.fetchone()
+        bal = int(row[0]) if row else 0
+        if bal < total_milli:
+            return False, f"余额不足（当前 {milli_to_coin(bal)} 金币）"
+        cur.execute("""
+        UPDATE wallets SET balance_milli=balance_milli-%s, updated_at=NOW()
+        WHERE chat_id=%s AND user_id=%s
+        """, (total_milli, chat_id, sender_id))
+        # 写日志
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+        VALUES(%s,%s,%s,%s,%s,'redpack')
+        """, (chat_id, sender_id, sender_id, -total_milli, f"send_redpack:{pack_id}"))
+        # 创建红包
+        cur.execute("""
+        INSERT INTO redpacks(pack_id,chat_id,sender_id,sender_name,
+          total_milli,remain_milli,total_count,remain_count,status,expire_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'open', NOW() + %s * INTERVAL '1 second')
+        """, (pack_id, chat_id, sender_id, sender_name,
+              total_milli, total_milli, count, count, expire_seconds))
+        return True, "ok"
+
+@with_conn
+def rp_grab(conn, pack_id: str, chat_id: int, user_id: int, user_name: str):
+    """
+    抢红包原子操作
+    返回 (ok: bool, msg: str, amount_milli: int)
+    """
+    with conn.cursor() as cur:
+        # 锁定红包行
+        cur.execute("""
+        SELECT remain_milli, remain_count, status, expire_at, sender_id
+        FROM redpacks WHERE pack_id=%s AND chat_id=%s FOR UPDATE
+        """, (pack_id, chat_id))
+        row = cur.fetchone()
+        if not row:
+            return False, "红包不存在", 0
+        remain_milli, remain_count, status, expire_at, sender_id = row
+
+        if status != 'open':
+            return False, "红包已结束", 0
+        # 过期检查（数据库时间）
+        cur.execute("SELECT NOW()")
+        now = cur.fetchone()[0]
+        if now > expire_at:
+            cur.execute("UPDATE redpacks SET status='expired' WHERE pack_id=%s", (pack_id,))
+            return False, "红包已过期", 0
+        if remain_count <= 0 or remain_milli <= 0:
+            cur.execute("UPDATE redpacks SET status='finished' WHERE pack_id=%s", (pack_id,))
+            return False, "红包已抢完", 0
+
+        # 是否已抢过
+        cur.execute("""
+        SELECT 1 FROM redpack_records
+        WHERE pack_id=%s AND user_id=%s
+        """, (pack_id, user_id))
+        if cur.fetchone():
+            return False, "你已经抢过这个红包了", 0
+
+        # 不能抢自己的（可选，注释掉则允许）
+        if user_id == sender_id:
+            return False, "不能抢自己发的红包", 0
+
+        # 随机金额：最后一个全拿剩余
+        if remain_count == 1:
+            amount = remain_milli
+        else:
+            # 保证每个剩余红包至少有 REDPACK_MIN_MILLI
+            max_grab = remain_milli - REDPACK_MIN_MILLI * (remain_count - 1)
+            max_grab = max(REDPACK_MIN_MILLI, max_grab)
+            amount = random.randint(REDPACK_MIN_MILLI, max_grab)
+
+        new_remain_milli = remain_milli - amount
+        new_remain_count = remain_count - 1
+        new_status = 'finished' if new_remain_count == 0 else 'open'
+
+        cur.execute("""
+        UPDATE redpacks
+        SET remain_milli=%s, remain_count=%s, status=%s
+        WHERE pack_id=%s
+        """, (new_remain_milli, new_remain_count, new_status, pack_id))
+
+        # 给抢红包者加钱
+        cur.execute("""
+        INSERT INTO wallets(chat_id,user_id,balance_milli,display_name,updated_at)
+        VALUES(%s,%s,%s,%s,NOW())
+        ON CONFLICT(chat_id,user_id)
+        DO UPDATE SET
+          balance_milli=wallets.balance_milli+EXCLUDED.balance_milli,
+          display_name=CASE WHEN EXCLUDED.display_name!='' THEN EXCLUDED.display_name ELSE wallets.display_name END,
+          updated_at=NOW()
+        """, (chat_id, user_id, amount, user_name))
+
+        # 写记录
+        cur.execute("""
+        INSERT INTO redpack_records(pack_id,chat_id,user_id,user_name,amount_milli)
+        VALUES(%s,%s,%s,%s,%s)
+        """, (pack_id, chat_id, user_id, user_name, amount))
+
+        # 写日志
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+        VALUES(%s,%s,%s,%s,%s,'redpack')
+        """, (chat_id, sender_id, user_id, amount, f"grab_redpack:{pack_id}"))
+
+        return True, new_status, amount
+
+@with_conn
+def rp_expire_refund(conn, pack_id: str, chat_id: int):
+    """超时退款"""
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT remain_milli, status, sender_id FROM redpacks
+        WHERE pack_id=%s AND chat_id=%s FOR UPDATE
+        """, (pack_id, chat_id))
+        row = cur.fetchone()
+        if not row:
+            return False, 0
+        remain_milli, status, sender_id = row
+        if status not in ('open', 'expired'):
+            return False, 0
+        cur.execute("""
+        UPDATE redpacks SET status='expired', remain_milli=0 WHERE pack_id=%s
+        """, (pack_id,))
+        if remain_milli > 0:
+            cur.execute("""
+            UPDATE wallets SET balance_milli=balance_milli+%s, updated_at=NOW()
+            WHERE chat_id=%s AND user_id=%s
+            """, (remain_milli, chat_id, sender_id))
+            cur.execute("""
+            INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+            VALUES(%s,%s,%s,%s,%s,'redpack')
+            """, (chat_id, 0, sender_id, remain_milli, f"refund_redpack:{pack_id}"))
+        return True, remain_milli
+
+@with_conn
+def rp_get(conn, pack_id: str, chat_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT pack_id,sender_id,sender_name,total_milli,remain_milli,
+               total_count,remain_count,status,expire_at
+        FROM redpacks WHERE pack_id=%s AND chat_id=%s
+        """, (pack_id, chat_id))
+        return cur.fetchone()
+
+@with_conn
+def rp_records(conn, pack_id: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT user_id,user_name,amount_milli,grabbed_at
+        FROM redpack_records WHERE pack_id=%s
+        ORDER BY grabbed_at ASC
+        """, (pack_id,))
+        return cur.fetchall()
+
+# ---------- 红包消息文本 ----------
+
+def rp_text(pack_info, records) -> str:
+    pack_id, sender_id, sender_name, total_milli, remain_milli, \
+        total_count, remain_count, status, expire_at = pack_info
+
+    grabbed_count = total_count - remain_count
+    grabbed_milli = total_milli - remain_milli
+
+    status_map = {
+        'open':     '🟢 抢红包中',
+        'finished': '🔴 已抢完',
+        'expired':  '⏰ 已过期',
+    }
+    status_str = status_map.get(status, status)
+
+    lines = [
+        f"🧧 <b>{sender_name}</b> 发了一个红包！",
+        f"💰 总金额：{milli_to_coin(total_milli)} 金币  共 {total_count} 个",
+        f"📊 状态：{status_str}  已抢 {grabbed_count}/{total_count} 个",
+        "",
+    ]
+    if records:
+        lines.append("🎉 抢红包记录：")
+        for uid, uname, amt, ts in records:
+            lines.append(f"  • {uname}：+{milli_to_coin(amt)} 金币")
+    if status == 'open':
+        lines.append("")
+        lines.append("👇 点击下方按钮抢红包")
+    return "\n".join(lines)
+
+def rp_keyboard(pack_id: str, status: str) -> InlineKeyboardMarkup:
+    if status == 'open':
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("🧧 抢红包", callback_data=f"rp:grab:{pack_id}"),
+            InlineKeyboardButton("📋 查看详情", callback_data=f"rp:detail:{pack_id}"),
+        ]])
+    else:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 查看详情", callback_data=f"rp:detail:{pack_id}"),
+        ]])
+
+# ---------- 红包 Handler ----------
+
+async def handle_redpack_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    触发格式：发红包 <金额> <个数>
+    例：发红包 10 5
+    """
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id
+    display_name = fmt_display_name(user.first_name, user.last_name, user.username, uid)
+
+    # 解析参数
+    parts = text.strip().split()
+    # parts[0] = '发红包', parts[1] = 金额, parts[2] = 个数
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "❌ 格式错误\n用法：发红包 <金额> <个数>\n例：发红包 10 5"
+        )
+        return
+
+    try:
+        total_milli = coin_to_milli(parts[1])
+        count = int(parts[2])
+    except Exception:
+        await update.message.reply_text("❌ 金额或个数格式错误")
+        return
+
+    if total_milli <= 0:
+        await update.message.reply_text("❌ 金额必须大于 0")
+        return
+    if count <= 0 or count > REDPACK_MAX_COUNT:
+        await update.message.reply_text(f"❌ 个数必须在 1~{REDPACK_MAX_COUNT} 之间")
+        return
+    if total_milli > REDPACK_MAX_TOTAL:
+        await update.message.reply_text(f"❌ 单次红包总金额不能超过 {milli_to_coin(REDPACK_MAX_TOTAL)} 金币")
+        return
+    # 保证每个红包至少 REDPACK_MIN_MILLI
+    if total_milli < count * REDPACK_MIN_MILLI:
+        await update.message.reply_text(
+            f"❌ 金额太少，{count} 个红包至少需要 {milli_to_coin(count * REDPACK_MIN_MILLI)} 金币"
+        )
+        return
+
+    pack_id = uuid.uuid4().hex[:12].upper()
+    ok, msg = rp_create(pack_id, chat_id, uid, display_name,
+                        total_milli, count, REDPACK_EXPIRE_SECONDS)
+    if not ok:
+        await update.message.reply_text(f"❌ 发红包失败：{msg}")
+        return
+
+    pack_info = rp_get(pack_id, chat_id)
+    records = rp_records(pack_id)
+    bot_msg = await update.message.reply_text(
+        rp_text(pack_info, records),
+        reply_markup=rp_keyboard(pack_id, 'open'),
+        parse_mode="HTML"
+    )
+
+    # 记录消息ID，用于超时更新
+    context.bot_data[f"rp_msg_{chat_id}_{pack_id}"] = bot_msg.message_id
+
+    # 超时自动退款任务
+    async def _expire_task():
+        await asyncio.sleep(REDPACK_EXPIRE_SECONDS)
+        ok2, refund = rp_expire_refund(pack_id, chat_id)
+        pack_info2 = rp_get(pack_id, chat_id)
+        records2 = rp_records(pack_id)
+        mid = context.bot_data.get(f"rp_msg_{chat_id}_{pack_id}")
+        if mid and pack_info2:
+            try:
+                expire_text = rp_text(pack_info2, records2)
+                if ok2 and refund > 0:
+                    expire_text += f"\n\n💸 已退回未抢金额 {milli_to_coin(refund)} 金币给发包人"
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=mid,
+                    text=expire_text,
+                    reply_markup=rp_keyboard(pack_id, 'expired'),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_expire_task())
+
+
+async def cb_redpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """红包回调：抢红包 / 查看详情"""
+    q = update.callback_query
+    if not q or not update.effective_user or not q.message:
+        return
+
+    chat_id = q.message.chat_id
+    if not is_allowed_chat(chat_id):
+        await q.answer()
+        return
+
+    uid = update.effective_user.id
+    user = update.effective_user
+    display_name = fmt_display_name(user.first_name, user.last_name, user.username, uid)
+    data = q.data or ""
+
+    if data.startswith("rp:grab:"):
+        pack_id = data[len("rp:grab:"):]
+        ok, result, amount = rp_grab(pack_id, chat_id, uid, display_name)
+
+        if not ok:
+            await q.answer(f"❌ {result}", show_alert=True)
+            # 若红包已结束，刷新消息
+            if result in ("红包已结束", "红包已抢完", "红包已过期"):
+                pack_info = rp_get(pack_id, chat_id)
+                records = rp_records(pack_id)
+                if pack_info:
+                    try:
+                        await q.edit_message_text(
+                            rp_text(pack_info, records),
+                            reply_markup=rp_keyboard(pack_id, pack_info[7]),
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+            return
+
+        await q.answer(f"🎉 抢到 {milli_to_coin(amount)} 金币！", show_alert=True)
+
+        # 刷新红包消息
+        pack_info = rp_get(pack_id, chat_id)
+        records = rp_records(pack_id)
+        if pack_info:
+            try:
+                await q.edit_message_text(
+                    rp_text(pack_info, records),
+                    reply_markup=rp_keyboard(pack_id, pack_info[7]),
+                    parse_mode="HTML"
+                )
+            except BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    logger.exception("rp edit failed")
+        return
+
+    if data.startswith("rp:detail:"):
+        pack_id = data[len("rp:detail:"):]
+        pack_info = rp_get(pack_id, chat_id)
+        records = rp_records(pack_id)
+        if not pack_info:
+            await q.answer("红包不存在", show_alert=True)
+            return
+        try:
+            await q.edit_message_text(
+                rp_text(pack_info, records),
+                reply_markup=rp_keyboard(pack_id, pack_info[7]),
+                parse_mode="HTML"
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                pass
+        await q.answer()
+        return
+
+    await q.answer()
+
+
+# =========================
+# PC28 游戏
+# =========================
+
+PC28_INTERVAL   = 120    # 每期秒数（2分钟）
+PC28_BET_CLOSE  = 20     # 开奖前N秒停止下注
+PC28_ODDS       = 1.9    # 大小单双赔率
+PC28_MIN_BET    = 10     # 最小下注（milli）
+PC28_MAX_BET    = 10_000_000  # 最大下注（milli）
+
+# 合法投注类型
+PC28_BET_TYPES = {"大", "小", "单", "双"}
+
+# ---------- PC28 开关（Redis）----------
+
+def pc28_is_enabled(chat_id: int) -> bool:
+    """检查该群PC28是否已由管理员开启"""
+    return rds.get(f"pc28_on:{chat_id}") == "1"
+
+def pc28_set_enabled(chat_id: int, enabled: bool):
+    """管理员开启/关闭PC28"""
+    if enabled:
+        rds.set(f"pc28_on:{chat_id}", "1")
+    else:
+        rds.delete(f"pc28_on:{chat_id}")
+
+# ---------- PC28 DB ----------
+
+@with_conn
+def pc28_get_or_create_period(conn, chat_id: int) -> tuple:
+    """
+    获取当前进行中的期，若无则创建新期
+    返回 (period_id, period_no, open_at, status, result)
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT id, period, open_at, status, result
+        FROM pc28_periods
+        WHERE chat_id=%s AND status IN ('betting','closed')
+        ORDER BY period DESC LIMIT 1
+        """, (chat_id,))
+        row = cur.fetchone()
+        if row:
+            return row
+        # 创建第一期
+        cur.execute("""
+        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods WHERE chat_id=%s
+        """, (chat_id,))
+        next_period = cur.fetchone()[0]
+        cur.execute("""
+        INSERT INTO pc28_periods(chat_id,period,open_at,status)
+        VALUES(%s, %s, NOW() + %s * INTERVAL '1 second', 'betting')
+        RETURNING id,period,open_at,status,result
+        """, (chat_id, next_period, PC28_INTERVAL))
+        return cur.fetchone()
+
+@with_conn
+def pc28_get_current(conn, chat_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT id,period,open_at,status,result
+        FROM pc28_periods
+        WHERE chat_id=%s AND status IN ('betting','closed')
+        ORDER BY period DESC LIMIT 1
+        """, (chat_id,))
+        return cur.fetchone()
+
+@with_conn
+def pc28_place_bet(conn, chat_id: int, period_id: int, user_id: int,
+                   user_name: str, bet_type: str, amount_milli: int):
+    with conn.cursor() as cur:
+        # 检查期状态
+        cur.execute("SELECT status FROM pc28_periods WHERE id=%s FOR UPDATE", (period_id,))
+        row = cur.fetchone()
+        if not row or row[0] != 'betting':
+            return False, "当前期已停止下注"
+
+        # 扣钱
+        cur.execute("""
+        SELECT balance_milli FROM wallets
+        WHERE chat_id=%s AND user_id=%s FOR UPDATE
+        """, (chat_id, user_id))
+        wrow = cur.fetchone()
+        bal = int(wrow[0]) if wrow else 0
+        if bal < amount_milli:
+            return False, f"余额不足（当前 {milli_to_coin(bal)} 金币）"
+
+        cur.execute("""
+        UPDATE wallets SET balance_milli=balance_milli-%s, updated_at=NOW()
+        WHERE chat_id=%s AND user_id=%s
+        """, (amount_milli, chat_id, user_id))
+
+        # 写注单
+        cur.execute("""
+        INSERT INTO pc28_bets(chat_id,period_id,user_id,user_name,bet_type,amount_milli,status)
+        VALUES(%s,%s,%s,%s,%s,%s,'pending')
+        """, (chat_id, period_id, user_id, user_name, bet_type, amount_milli))
+
+        # 写日志
+        cur.execute("""
+        INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+        VALUES(%s,%s,%s,%s,%s,'pc28')
+        """, (chat_id, user_id, user_id, -amount_milli, f"pc28_bet:{bet_type}:{period_id}"))
+
+        return True, "ok"
+
+@with_conn
+def pc28_settle(conn, chat_id: int, period_id: int, result_str: str):
+    """
+    开奖结算
+    result_str: 如 "14:大:双"  (和值:大小:单双)
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE pc28_periods SET status='settled', result=%s
+        WHERE id=%s AND chat_id=%s
+        """, (result_str, period_id, chat_id))
+
+        # 取所有待结算注单
+        cur.execute("""
+        SELECT id,user_id,user_name,bet_type,amount_milli
+        FROM pc28_bets WHERE period_id=%s AND chat_id=%s AND status='pending'
+        FOR UPDATE
+        """, (period_id, chat_id))
+        bets = cur.fetchall()
+
+        # 解析结果
+        parts = result_str.split(":")
+        winning_types = set(parts[1:])  # {'大','双'} 或 {'小','单'} 等
+
+        winners = []
+        for bid, uid, uname, btype, amt in bets:
+            if btype in winning_types:
+                payout = int(amt * PC28_ODDS)
+                cur.execute("""
+                UPDATE pc28_bets SET status='win', payout_milli=%s WHERE id=%s
+                """, (payout, bid))
+                # 返还本金+奖励
+                cur.execute("""
+                INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
+                VALUES(%s,%s,%s,NOW())
+                ON CONFLICT(chat_id,user_id)
+                DO UPDATE SET balance_milli=wallets.balance_milli+EXCLUDED.balance_milli,updated_at=NOW()
+                """, (chat_id, uid, payout))
+                cur.execute("""
+                INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+                VALUES(%s,0,%s,%s,%s,'pc28')
+                """, (chat_id, uid, payout, f"pc28_win:{btype}:{period_id}"))
+                winners.append((uid, uname, btype, amt, payout))
+            else:
+                cur.execute("""
+                UPDATE pc28_bets SET status='lose', payout_milli=0 WHERE id=%s
+                """, (bid,))
+        return winners, bets
+
+@with_conn
+def pc28_get_bets(conn, chat_id: int, period_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT user_id,user_name,bet_type,amount_milli,status,payout_milli
+        FROM pc28_bets
+        WHERE period_id=%s AND chat_id=%s AND status != 'refund'
+        ORDER BY id ASC
+        """, (period_id, chat_id))
+        return cur.fetchall()
+    
+@with_conn
+def pc28_close_betting(conn, chat_id: int, period_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE pc28_periods SET status='closed'
+        WHERE id=%s AND chat_id=%s AND status='betting'
+        """, (period_id, chat_id))
+
+@with_conn
+def pc28_create_next(conn, chat_id: int) -> tuple:
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods WHERE chat_id=%s
+        """, (chat_id,))
+        next_period = cur.fetchone()[0]
+        cur.execute("""
+        INSERT INTO pc28_periods(chat_id,period,open_at,status)
+        VALUES(%s, %s, NOW() + %s * INTERVAL '1 second', 'betting')
+        RETURNING id,period,open_at,status,result
+        """, (chat_id, next_period, PC28_INTERVAL))
+        return cur.fetchone()
+
+# ── 新增：停止时退款当前未结算注单 ──
+@with_conn
+def pc28_refund_pending(conn, chat_id: int) -> int:
+    """退还当前未结算期的所有pending注单，返回退款笔数"""
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT id FROM pc28_periods
+        WHERE chat_id=%s AND status IN ('betting','closed')
+        ORDER BY period DESC LIMIT 1
+        """, (chat_id,))
+        row = cur.fetchone()
+        if not row:
+            return 0
+        period_id = row[0]
+        cur.execute("""
+        SELECT id, user_id, amount_milli FROM pc28_bets
+        WHERE period_id=%s AND chat_id=%s AND status='pending'
+        FOR UPDATE
+        """, (period_id, chat_id))
+        bets = cur.fetchall()
+        for bid, uid, amt in bets:
+            cur.execute("""
+            UPDATE pc28_bets SET status='refund' WHERE id=%s
+            """, (bid,))
+            cur.execute("""
+            INSERT INTO wallets(chat_id,user_id,balance_milli,updated_at)
+            VALUES(%s,%s,%s,NOW())
+            ON CONFLICT(chat_id,user_id)
+            DO UPDATE SET balance_milli=wallets.balance_milli+EXCLUDED.balance_milli,
+                          updated_at=NOW()
+            """, (chat_id, uid, amt))
+            cur.execute("""
+            INSERT INTO coin_logs(chat_id,operator_id,user_id,delta_milli,reason,log_type)
+            VALUES(%s,0,%s,%s,'pc28_stop_refund','pc28')
+            """, (chat_id, uid, amt))
+        cur.execute("""
+        UPDATE pc28_periods SET status='cancelled'
+        WHERE id=%s
+        """, (period_id,))
+        return len(bets)
+
+async def _pc28_refund_current(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """异步退款任务，退完后发群通知"""
+    count = pc28_refund_pending(chat_id)
+    if count > 0:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"💸 PC28已停止，共退还 <b>{count}</b> 笔注单金币给各下注用户",
+                parse_mode="HTML"
+            )
+        except Exception:
+            logger.exception("_pc28_refund_current send failed")
+
+# ---------- PC28 开奖逻辑 ----------
+
+def pc28_draw() -> tuple:
+    """
+    模拟PC28开奖：3个骰子（0-9）求和
+    返回 (n1, n2, n3, total, size, parity)
+    size: 大(>=14) / 小(<14)
+    parity: 单 / 双
+    """
+    n1, n2, n3 = random.randint(0, 9), random.randint(0, 9), random.randint(0, 9)
+    total = n1 + n2 + n3
+    size = "大" if total >= 14 else "小"
+    parity = "双" if total % 2 == 0 else "单"
+    return n1, n2, n3, total, size, parity
+
+def pc28_period_text(period_row, bets=None, is_current=True) -> str:
+    pid, period_no, open_at, status, result = period_row
+
+    # 倒计时
+    if status == 'betting':
+        try:
+            now = datetime.datetime.now(tz=open_at.tzinfo)
+            remain = max(0, int((open_at - now).total_seconds()))
+            close_remain = max(0, remain - PC28_BET_CLOSE)
+        except Exception:
+            remain = 0
+            close_remain = 0
+        time_line = f"⏳ 距开奖：{remain}秒  距停止下注：{close_remain}秒"
+        status_str = "🟢 投注中"
+    elif status == 'closed':
+        time_line = "🔒 已停止下注，等待开奖..."
+        status_str = "🔒 停止下注"
+    elif status == 'settled':
+        time_line = ""
+        status_str = "✅ 已开奖"
+    else:
+        time_line = ""
+        status_str = status
+
+    lines = [
+        f"🎲 <b>PC28 第 {period_no} 期</b>",
+        f"📌 状态：{status_str}",
+    ]
+    if time_line:
+        lines.append(time_line)
+
+    if result:
+        parts = result.split(":")
+        total_val = parts[0]
+        tags = " ".join(parts[1:])
+        lines.append(f"🎯 开奖结果：{total_val}  [{tags}]")
+
+    lines.append("")
+    lines.append("📊 赔率：大/小/单/双 均为 1.9 倍")
+    lines.append("💬 投注格式：押大 10  押小 5  押单 3  押双 8")
+
+    if bets:
+        lines.append("")
+        lines.append("📋 本期注单：")
+        # 按类型汇总
+        summary: dict = {}
+        for uid, uname, btype, amt, st, payout in bets:
+            summary.setdefault(btype, []).append((uname, amt, st, payout))
+        for btype, items in summary.items():
+            total_bet = sum(a for _, a, _, _ in items)
+            lines.append(f"  {btype}：共 {len(items)} 注 / {milli_to_coin(total_bet)} 金币")
+
+    return "\n".join(lines)
+
+# ---------- PC28 定时任务 ----------
+
+# 全局：每个群的当前期信息缓存 {chat_id: (period_id, open_at)}
+_pc28_tasks: dict[int, asyncio.Task] = {}
+
+async def pc28_run_period(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                          period_row: tuple, announce_msg_id: int | None = None):
+    """
+    管理单期生命周期：
+    1. 等待到停止下注时间 → 更新消息
+    2. 等待到开奖时间 → 开奖 → 发结果 → 创建下一期
+    """
+    pid, period_no, open_at, status, _ = period_row
+
+    try:
+        # ── 检查开关，若已关闭则直接退出 ──
+        if not pc28_is_enabled(chat_id):
+            return
+
+        # 计算剩余时间
+        now = datetime.datetime.now(tz=open_at.tzinfo)
+        total_remain = max(0, (open_at - now).total_seconds())
+        close_remain = max(0, total_remain - PC28_BET_CLOSE)
+
+        # ── 阶段1：等到停止下注 ──
+        if close_remain > 0:
+            await asyncio.sleep(close_remain)
+
+        pc28_close_betting(chat_id, pid)
+
+        # 更新公告消息
+        if announce_msg_id:
+            period_row2 = pc28_get_current(chat_id)
+            if period_row2:
+                try:
+                    bets = pc28_get_bets(chat_id, pid)
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=announce_msg_id,
+                        text=pc28_period_text(period_row2, bets, is_current=True),
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+        # ── 阶段2：等到开奖 ──
+        await asyncio.sleep(PC28_BET_CLOSE)
+
+        # 开奖
+        n1, n2, n3, total, size, parity = pc28_draw()
+        result_str = f"{total}:{size}:{parity}"
+        winners, all_bets = pc28_settle(chat_id, pid, result_str)
+
+        # 构造开奖消息
+        result_lines = [
+            f"🎲 <b>PC28 第 {period_no} 期 开奖结果</b>",
+            f"🎯 号码：{n1} + {n2} + {n3} = <b>{total}</b>",
+            f"📌 结果：<b>{size} {parity}</b>",
+            "",
+        ]
+        if winners:
+            result_lines.append("🏆 中奖名单：")
+            for uid, uname, btype, amt, payout in winners:
+                profit = payout - amt
+                result_lines.append(
+                    f"  🎉 {uname}  押{btype} {milli_to_coin(amt)}金币"
+                    f"  → +{milli_to_coin(profit)} 金币"
+                )
+        else:
+            result_lines.append("😔 本期无人中奖")
+
+        result_lines.append("")
+        result_lines.append(f"⏰ 下一期即将开始...")
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(result_lines),
+            parse_mode="HTML"
+        )
+
+        # 更新公告消息为已结束
+        if announce_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=announce_msg_id,
+                    text="\n".join(result_lines),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        # ── 创建下一期前再次检查开关 ──
+        if not pc28_is_enabled(chat_id):
+            return
+
+        # ── 创建下一期 ──
+        await asyncio.sleep(3)
+        next_row = pc28_create_next(chat_id)
+        bets_next = []
+        new_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=pc28_period_text(next_row, bets_next, is_current=True),
+            parse_mode="HTML"
+        )
+        # 递归启动下一期
+        task = asyncio.create_task(
+            pc28_run_period(context, chat_id, next_row, new_msg.message_id)
+        )
+        _pc28_tasks[chat_id] = task
+
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(f"pc28_run_period error chat={chat_id}")
+
+
+async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    关键词 '28开奖' → 仅群管理员可开启
+    关键词 '28停止' → 仅群管理员可停止
+    """
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    msg_text = (update.message.text or "").strip()
+
+    # ── 停止指令 ──
+    if msg_text == "28停止":
+        if not await is_group_admin(context, chat_id, uid):
+            await update.message.reply_text("❌ 仅群管理员可停止 PC28 游戏")
+            return
+        # 取消运行中的定时任务
+        task = _pc28_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+        pc28_set_enabled(chat_id, False)
+        await update.message.reply_text("🛑 PC28 游戏已停止\n正在退还当前期未开奖注单...")
+        asyncio.create_task(_pc28_refund_current(context, chat_id))
+        return
+
+    # ── 开启指令（28开奖）──
+    if not await is_group_admin(context, chat_id, uid):
+        await update.message.reply_text("❌ 仅群管理员可开启 PC28 游戏")
+        return
+
+    if pc28_is_enabled(chat_id):
+        # 已开启，只刷新显示当前期状态
+        period_row = pc28_get_or_create_period(chat_id)
+        bets = pc28_get_bets(chat_id, period_row[0])
+        await update.message.reply_text(
+            pc28_period_text(period_row, bets, is_current=True),
+            parse_mode="HTML"
+        )
+        # 若任务意外停了则重启
+        existing = _pc28_tasks.get(chat_id)
+        if existing is None or existing.done():
+            task = asyncio.create_task(
+                pc28_run_period(context, chat_id, period_row, None)
+            )
+            _pc28_tasks[chat_id] = task
+        return
+
+    # 首次开启
+    pc28_set_enabled(chat_id, True)
+    period_row = pc28_get_or_create_period(chat_id)
+    bets = pc28_get_bets(chat_id, period_row[0])
+    msg = await update.message.reply_text(
+        pc28_period_text(period_row, bets, is_current=True),
+        parse_mode="HTML"
+    )
+    existing = _pc28_tasks.get(chat_id)
+    if existing is None or existing.done():
+        task = asyncio.create_task(
+            pc28_run_period(context, chat_id, period_row, msg.message_id)
+        )
+        _pc28_tasks[chat_id] = task
+
+
+async def handle_pc28_bet(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          bet_type: str, text: str):
+    """
+    关键词：押大/押小/押单/押双 <金额>
+    """
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    uid = user.id
+    display_name = fmt_display_name(user.first_name, user.last_name, user.username, uid)
+
+    # ── 新增：检查PC28是否已由管理员开启 ──
+    if not pc28_is_enabled(chat_id):
+        await update.message.reply_text("❌ PC28 游戏未开启，请等待管理员开启")
+        return
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        await update.message.reply_text(f"❌ 格式：押{bet_type} <金额>\n例：押{bet_type} 10")
+        return
+
+    try:
+        amount_milli = coin_to_milli(parts[1])
+    except Exception:
+        await update.message.reply_text("❌ 金额格式错误")
+        return
+
+    if amount_milli < PC28_MIN_BET:
+        await update.message.reply_text(f"❌ 最小下注 {milli_to_coin(PC28_MIN_BET)} 金币")
+        return
+    if amount_milli > PC28_MAX_BET:
+        await update.message.reply_text(f"❌ 最大下注 {milli_to_coin(PC28_MAX_BET)} 金币")
+        return
+
+    period_row = pc28_get_current(chat_id)
+    if not period_row:
+        await update.message.reply_text("❌ 当前没有进行中的期，请先发送「28开奖」开启游戏")
+        return
+
+    pid, period_no, open_at, status, _ = period_row
+    if status != 'betting':
+        await update.message.reply_text("❌ 当前期已停止下注，请等待下一期")
+        return
+
+    ok, msg = pc28_place_bet(chat_id, pid, uid, display_name, bet_type, amount_milli)
+    if not ok:
+        await update.message.reply_text(f"❌ 下注失败：{msg}")
+        return
+
+    bal = wallet_get(chat_id, uid)
+    await update.message.reply_text(
+        f"✅ 下注成功！\n"
+        f"第 {period_no} 期  押 <b>{bet_type}</b>  {milli_to_coin(amount_milli)} 金币\n"
+        f"赔率：{PC28_ODDS}x  中奖可得：{milli_to_coin(int(amount_milli * PC28_ODDS))} 金币\n"
+        f"剩余余额：{milli_to_coin(bal)} 金币",
+        parse_mode="HTML"
+    )
+
 
 # =========================
 # Statistics
@@ -1073,9 +2065,9 @@ def kb_logs(chat_id: int, page: int, log_type: str = "all"):
         marker = "●" if log_type == lt else ""
         return InlineKeyboardButton(f"{marker}{label}", callback_data=f"v4:logs:0:{lt}")
     return InlineKeyboardMarkup([
-        [_btn("全部", "all"), _btn("发放", "drop"),
-         _btn("兑换", "redeem"), _btn("管理", "admin"),
-         _btn("转账", "transfer")],
+        [_btn("全部", "all"), _btn("发放", "drop"), _btn("兑换", "redeem")],
+        [_btn("管理", "admin"), _btn("转账", "transfer"),
+         _btn("🧧红包", "redpack"), _btn("🎲PC28", "pc28")],
         [InlineKeyboardButton("⬅️", callback_data=f"v4:logs:{max(0,page-1)}:{log_type}"),
          InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="v4:noop"),
          InlineKeyboardButton("➡️", callback_data=f"v4:logs:{min(max_page,page+1)}:{log_type}")],
@@ -1765,7 +2757,7 @@ async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_type = parts[3] if len(parts) > 3 else "all"
         lt_filter = log_type if log_type != "all" else None
         logs = coin_logs_page(chat_id, LOG_SIZE, page * LOG_SIZE, lt_filter)
-        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸"}
+        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸", "redpack": "🧧", "pc28": "🎲"}
         lines = [f"🧾 操作日志（{log_type}）\n"]
         for row in logs:
             lid, op, tgt, delta, reason, ts, lt = row
@@ -2118,7 +3110,7 @@ async def cb_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_page = max(0, (total - 1) // LOG_SIZE) if total > 0 else 0
         page = clamp(page, 0, max_page)
         logs = user_coin_logs_page(chat_id, uid, LOG_SIZE, page * LOG_SIZE)
-        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸"}
+        type_icons = {"drop": "🎁", "redeem": "🛒", "admin": "🔧", "transfer": "💸", "redpack": "🧧", "pc28": "🎲"}
         lines = [f"📋 我的金币记录\n"]
         for row in logs:
             lid, op, tgt, delta, reason, ts, lt = row
@@ -2486,6 +3478,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await auto_delete_pair(context, chat_id,
                 update.message.message_id, bot_msg.message_id, 60)
             return
+        
+        # ── 红包关键词触发 ──
+        if msg_text.startswith("发红包"):
+            await handle_redpack_send(update, context, msg_text)
+            return
+
+        # ── PC28 关键词触发 ──
+        if msg_text.strip() in ("28开奖", "28停止"):
+            await handle_pc28_query(update, context)
+            return
+
+        # 押注关键词：押大 / 押小 / 押单 / 押双
+        for _bt in ("大", "小", "单", "双"):
+            if msg_text.startswith(f"押{_bt}"):
+                await handle_pc28_bet(update, context, _bt, msg_text)
+                return
 
         # 金币发放
         if not valid_text_basic(msg_text, MIN_TEXT_LEN):
@@ -2573,6 +3581,7 @@ def main():
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("pay", cmd_pay))
 
+    app.add_handler(CallbackQueryHandler(cb_redpack, pattern=r"^rp:"))
     app.add_handler(CallbackQueryHandler(cb_pub_rank, pattern=r"^v4:pub_rank:"))
     app.add_handler(CallbackQueryHandler(cb_user,     pattern=r"^v4:u:"))
     app.add_handler(CallbackQueryHandler(cb,          pattern=r"^v4:"))
@@ -2591,5 +3600,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
