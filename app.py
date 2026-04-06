@@ -336,10 +336,10 @@ def init_db(conn):
           period   INT NOT NULL,
           open_at  TIMESTAMP NOT NULL,
           status   TEXT NOT NULL DEFAULT 'betting',
-          result   TEXT,
-          UNIQUE(chat_id, period)
+          result   TEXT
         );
         """)
+
         # ── PC28 注单表 ──
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pc28_bets (
@@ -382,6 +382,15 @@ def migrate_db(conn):
             """DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM information_schema.columns
                WHERE table_name='wallets' AND column_name='display_name') THEN
                ALTER TABLE wallets ADD COLUMN display_name TEXT NOT NULL DEFAULT ''; END IF; END $$;""",
+            """DO $$ BEGIN
+               IF EXISTS (
+                 SELECT 1 FROM information_schema.table_constraints
+                 WHERE table_name='pc28_periods'
+                 AND constraint_name='pc28_periods_chat_id_period_key'
+               ) THEN
+                 ALTER TABLE pc28_periods DROP CONSTRAINT pc28_periods_chat_id_period_key;
+               END IF;
+             END $$;""",
         ]:
             cur.execute(ddl)
 
@@ -870,10 +879,10 @@ def rp_grab(conn, pack_id: str, chat_id: int, user_id: int, user_name: str):
 
         if status != 'open':
             return False, "红包已结束", 0
-        # 过期检查（数据库时间）
-        cur.execute("SELECT NOW()")
-        now = cur.fetchone()[0]
-        if now > expire_at:
+        # 过期检查（完全在数据库内比较，避免时区问题）
+        cur.execute("SELECT NOW() > expire_at FROM redpacks WHERE pack_id=%s", (pack_id,))
+        is_expired = cur.fetchone()[0]
+        if is_expired:
             cur.execute("UPDATE redpacks SET status='expired' WHERE pack_id=%s", (pack_id,))
             return False, "红包已过期", 0
         if remain_count <= 0 or remain_milli <= 0:
@@ -1216,25 +1225,24 @@ def pc28_set_enabled(chat_id: int, enabled: bool):
 
 # ---------- PC28 DB ----------
 
+# 修改后
 @with_conn
 def pc28_get_or_create_period(conn, chat_id: int) -> tuple:
-    """
-    获取当前进行中的期，若无则创建新期
-    返回 (period_id, period_no, open_at, status, result)
-    """
     with conn.cursor() as cur:
         cur.execute("""
         SELECT id, period, open_at, status, result
         FROM pc28_periods
         WHERE chat_id=%s AND status IN ('betting','closed')
+        AND DATE(open_at) = CURRENT_DATE
         ORDER BY period DESC LIMIT 1
         """, (chat_id,))
         row = cur.fetchone()
         if row:
             return row
-        # 创建第一期
+        # 创建第一期：当日期数从1开始
         cur.execute("""
-        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods WHERE chat_id=%s
+        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods
+        WHERE chat_id=%s AND DATE(open_at) = CURRENT_DATE
         """, (chat_id,))
         next_period = cur.fetchone()[0]
         cur.execute("""
@@ -1251,6 +1259,7 @@ def pc28_get_current(conn, chat_id: int):
         SELECT id,period,open_at,status,result
         FROM pc28_periods
         WHERE chat_id=%s AND status IN ('betting','closed')
+        AND DATE(open_at) = CURRENT_DATE
         ORDER BY period DESC LIMIT 1
         """, (chat_id,))
         return cur.fetchone()
@@ -1365,8 +1374,10 @@ def pc28_close_betting(conn, chat_id: int, period_id: int):
 @with_conn
 def pc28_create_next(conn, chat_id: int) -> tuple:
     with conn.cursor() as cur:
+        # 当日期数自增
         cur.execute("""
-        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods WHERE chat_id=%s
+        SELECT COALESCE(MAX(period),0)+1 FROM pc28_periods
+        WHERE chat_id=%s AND DATE(open_at) = CURRENT_DATE
         """, (chat_id,))
         next_period = cur.fetchone()[0]
         cur.execute("""
@@ -1469,8 +1480,9 @@ def pc28_period_text(period_row, bets=None, is_current=True) -> str:
         time_line = ""
         status_str = status
 
+    date_str = open_at.strftime("%m月%d日") if open_at else ""
     lines = [
-        f"🎲 <b>PC28 第 {period_no} 期</b>",
+        f"🎲 <b>PC28 {date_str} 第 {period_no} 期</b>",
         f"📌 状态：{status_str}",
     ]
     if time_line:
@@ -1553,8 +1565,10 @@ async def pc28_run_period(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         winners, all_bets = pc28_settle(chat_id, pid, result_str)
 
         # 构造开奖消息
+        open_at_row = period_row[2]
+        date_str = open_at_row.strftime("%m月%d日") if open_at_row else ""
         result_lines = [
-            f"🎲 <b>PC28 第 {period_no} 期 开奖结果</b>",
+            f"🎲 <b>PC28 {date_str} 第 {period_no} 期 开奖结果</b>",
             f"🎯 号码：{n1} + {n2} + {n3} = <b>{total}</b>",
             f"📌 结果：<b>{size} {parity}</b>",
             "",
@@ -1573,11 +1587,14 @@ async def pc28_run_period(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         result_lines.append("")
         result_lines.append(f"⏰ 下一期即将开始...")
 
-        await context.bot.send_message(
+        result_msg = await context.bot.send_message(
             chat_id=chat_id,
             text="\n".join(result_lines),
             parse_mode="HTML"
         )
+        # 开奖结果30秒后自毁
+        auto_delete_pair(context, chat_id,
+            result_msg.message_id, result_msg.message_id, 30)
 
         # 更新公告消息为已结束
         if announce_msg_id:
@@ -1630,12 +1647,15 @@ async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_group_admin(context, chat_id, uid):
             await update.message.reply_text("❌ 仅群管理员可停止 PC28 游戏")
             return
-        # 取消运行中的定时任务
         task = _pc28_tasks.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
         pc28_set_enabled(chat_id, False)
-        await update.message.reply_text("🛑 PC28 游戏已停止\n正在退还当前期未开奖注单...")
+        bot_msg = await update.message.reply_text(
+            "🛑 PC28 游戏已停止\n正在退还当前期未开奖注单..."
+        )
+        auto_delete_pair(context, chat_id,
+            update.message.message_id, bot_msg.message_id, 30)
         asyncio.create_task(_pc28_refund_current(context, chat_id))
         return
 
@@ -1648,10 +1668,12 @@ async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 已开启，只刷新显示当前期状态
         period_row = pc28_get_or_create_period(chat_id)
         bets = pc28_get_bets(chat_id, period_row[0])
-        await update.message.reply_text(
+        bot_msg = await update.message.reply_text(
             pc28_period_text(period_row, bets, is_current=True),
             parse_mode="HTML"
         )
+        auto_delete_pair(context, chat_id,
+            update.message.message_id, bot_msg.message_id, 30)
         # 若任务意外停了则重启
         existing = _pc28_tasks.get(chat_id)
         if existing is None or existing.done():
@@ -1669,13 +1691,14 @@ async def handle_pc28_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pc28_period_text(period_row, bets, is_current=True),
         parse_mode="HTML"
     )
+    auto_delete_pair(context, chat_id,
+        update.message.message_id, msg.message_id, 30)
     existing = _pc28_tasks.get(chat_id)
     if existing is None or existing.done():
         task = asyncio.create_task(
             pc28_run_period(context, chat_id, period_row, msg.message_id)
         )
         _pc28_tasks[chat_id] = task
-
 
 async def handle_pc28_bet(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           bet_type: str, text: str):
@@ -1726,14 +1749,15 @@ async def handle_pc28_bet(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     bal = wallet_get(chat_id, uid)
-    await update.message.reply_text(
+    bot_msg = await update.message.reply_text(
         f"✅ 下注成功！\n"
         f"第 {period_no} 期  押 <b>{bet_type}</b>  {milli_to_coin(amount_milli)} 金币\n"
         f"赔率：{PC28_ODDS}x  中奖可得：{milli_to_coin(int(amount_milli * PC28_ODDS))} 金币\n"
         f"剩余余额：{milli_to_coin(bal)} 金币",
         parse_mode="HTML"
     )
-
+    auto_delete_pair(context, chat_id,
+        update.message.message_id, bot_msg.message_id, 30)
 
 # =========================
 # Statistics
@@ -2243,12 +2267,13 @@ async def notify_purchase(context: ContextTypes.DEFAULT_TYPE,
 # =========================
 # auto_delete / safe_edit
 # =========================
-async def auto_delete_pair(context, chat_id, trigger_mid, bot_mid, delay=120):
+# 修改后
+def auto_delete_pair(context, chat_id, trigger_mid, bot_mid, delay=120):
     if delay <= 0:
         return
     async def _del():
         await asyncio.sleep(delay)
-        for mid in [trigger_mid, bot_mid]:
+        for mid in set([trigger_mid, bot_mid]):  # 用 set 去重，避免同一条消息删两次
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except Exception:
@@ -3455,7 +3480,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_msg = await update.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
             context.bot_data[f"rank_owner_{chat_id}_{bot_msg.message_id}"] = user_id
             rd = settings.get("rank_delete_seconds", 120)
-            await auto_delete_pair(context, chat_id,
+            auto_delete_pair(context, chat_id,
                 update.message.message_id, bot_msg.message_id, rd)
             return
 
@@ -3475,7 +3500,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
             context.bot_data[f"shop_owner_{chat_id}_{bot_msg.message_id}"] = user_id
-            await auto_delete_pair(context, chat_id,
+            auto_delete_pair(context, chat_id,
                 update.message.message_id, bot_msg.message_id, 60)
             return
         
